@@ -5,10 +5,10 @@
 //+------------------------------------------------------------------+
 #property copyright "Box Strategy EA"
 #property link      "https://github.com/p99agent/box_strategy"
-#property version   "1.20"
-#property description "Box Strategy Scalping EA - Phase 1 MVP v1.2"
+#property version   "1.30"
+#property description "Box Strategy Scalping EA - Phase 1 MVP v1.3"
 #property description "EUR/USD | 10:00-12:00 ET | 9 pips box | 3 pips target"
-#property description "v1.2: Added entry throttle, box visualization, log rate limit"
+#property description "v1.3: Added RECYCLE mode (reset clicks when flat + profit)"
 
 //+------------------------------------------------------------------+
 //| Includes                                                          |
@@ -46,6 +46,14 @@
 #define ENTRY_LINE_PREFIX   "BoxEA_Entry_"
 
 //+------------------------------------------------------------------+
+//| Click Mode Enum (v1.3)                                            |
+//+------------------------------------------------------------------+
+enum ENUM_CLICK_MODE {
+    CLICK_MODE_SESSION,   // SESSION: Fixed budget (16/day max)
+    CLICK_MODE_RECYCLE    // RECYCLE: Reset when flat + profit
+};
+
+//+------------------------------------------------------------------+
 //| Input Parameters                                                  |
 //+------------------------------------------------------------------+
 input group "=== Timezone Settings ==="
@@ -65,6 +73,9 @@ input color    InpSellColor = clrRed;     // Sell arrow color
 
 input group "=== Safety Settings ==="
 input bool     InpStrictMVP = true;       // Block trading on non-EURUSD (MVP mode)
+
+input group "=== Click Mode (v1.3) ==="
+input ENUM_CLICK_MODE InpClickMode = CLICK_MODE_RECYCLE;  // Click budget mode
 
 //+------------------------------------------------------------------+
 //| Global Variables                                                  |
@@ -100,6 +111,8 @@ int            g_winningTrades = 0;
 int            g_losingTrades = 0;
 double         g_totalPipsGained = 0;
 double         g_totalPipsLost = 0;
+double         g_sessionPnL = 0;          // Session P/L for recycle logic (v1.3)
+int            g_openPositionsCount = 0;  // Track number of open positions
 
 //+------------------------------------------------------------------+
 //| Helper Functions - SPEC-001: Pip Size                            |
@@ -214,12 +227,48 @@ void ResetSessionCounters()
     g_campaignEntryPrice = 0;
     g_campaignLots = 0;
     g_lastTradeBar = 0;
+    g_sessionPnL = 0;
+    g_openPositionsCount = 0;
     
     SaveStateToGlobalVariables();
     
     Print("=== NEW SESSION STARTED ===");
     Print("Session Start Equity: ", g_sessionStartEquity);
     Print("Broker Session Hours: ", GetBrokerSessionStart(), ":00 - ", GetBrokerSessionEnd(), ":00");
+    Print("Click Mode: ", (InpClickMode == CLICK_MODE_RECYCLE ? "RECYCLE" : "SESSION"));
+}
+
+//+------------------------------------------------------------------+
+//| v1.3: Click Recycle Logic                                         |
+//+------------------------------------------------------------------+
+void CheckClickRecycle()
+{
+    // Only recycle if RECYCLE mode is enabled
+    if (InpClickMode != CLICK_MODE_RECYCLE)
+        return;
+    
+    // Calculate current session P/L
+    double current_equity = AccountInfoDouble(ACCOUNT_EQUITY);
+    g_sessionPnL = current_equity - g_sessionStartEquity;
+    
+    // If session is profitable (or break-even), reset clicks
+    if (g_sessionPnL >= 0)
+    {
+        int old_clicks = g_sessionClicksUsed;
+        g_sessionClicksUsed = 0;
+        g_currentBox = 1;  // Also reset box level since no drawdown
+        
+        SaveStateToGlobalVariables();
+        
+        Print("=== CLICK RECYCLE TRIGGERED ===");
+        Print("Session P/L: +", DoubleToString(g_sessionPnL, 2));
+        Print("Clicks reset: ", old_clicks, " -> 0");
+        Print("Ready for new campaign!");
+    }
+    else
+    {
+        Print("Session P/L is negative (", DoubleToString(g_sessionPnL, 2), "), clicks NOT reset");
+    }
 }
 
 //+------------------------------------------------------------------+
@@ -260,6 +309,7 @@ void UpdateCampaignTracking()
     double total_lots = 0;
     double weighted_sum = 0;
     int direction = 0;
+    int positions_count = 0;
     
     for (int i = PositionsTotal() - 1; i >= 0; i--)
     {
@@ -272,6 +322,7 @@ void UpdateCampaignTracking()
                 
                 total_lots += lots;
                 weighted_sum += entry * lots;
+                positions_count++;
                 
                 // Determine direction from position type
                 if (posInfo.PositionType() == POSITION_TYPE_BUY)
@@ -281,6 +332,10 @@ void UpdateCampaignTracking()
             }
         }
     }
+    
+    // Check if we just went flat (had positions, now none)
+    bool just_went_flat = (g_openPositionsCount > 0 && positions_count == 0);
+    g_openPositionsCount = positions_count;
     
     if (total_lots > 0)
     {
@@ -294,6 +349,12 @@ void UpdateCampaignTracking()
         g_campaignLots = 0;
         g_campaignEntryPrice = 0;
         g_campaignDirection = 0;
+        
+        // v1.3: Check for click recycle when going flat
+        if (just_went_flat)
+        {
+            CheckClickRecycle();
+        }
     }
 }
 
@@ -732,12 +793,16 @@ void UpdateInfoPanel()
     string trading_status = g_tradingEnabled ? "ENABLED" : "DISABLED";
     string campaign_str = (g_campaignDirection == 1) ? "LONG" : 
                           (g_campaignDirection == -1) ? "SHORT" : "NONE";
+    string click_mode_str = (InpClickMode == CLICK_MODE_RECYCLE) ? "RECYCLE" : "SESSION";
+    
+    // Calculate current session P/L
+    double current_pnl = AccountInfoDouble(ACCOUNT_EQUITY) - g_sessionStartEquity;
     
     // Build panel string (MQL5 Comment() has parameter limit)
     string panel = "";
-    panel += "=== BOX STRATEGY EA v1.2 (MVP) ===\n";
+    panel += "=== BOX STRATEGY EA v1.3 (MVP) ===\n";
     panel += "Symbol: " + _Symbol + " | TF: " + EnumToString(Period()) + "\n";
-    panel += "Mode: " + (InpStrictMVP ? "STRICT MVP (EURUSD only)" : "Flexible") + "\n";
+    panel += "Click Mode: " + click_mode_str + "\n";
     panel += "----------------------------------------\n";
     panel += "Session: " + session_status + " (" + IntegerToString(GetBrokerSessionStart()) + ":00-" + IntegerToString(GetBrokerSessionEnd()) + ":00)\n";
     panel += "Trading: " + trading_status + "\n";
@@ -746,16 +811,15 @@ void UpdateInfoPanel()
     panel += "Clicks Used: " + IntegerToString(g_sessionClicksUsed) + " / " + IntegerToString(MAX_CLICKS) + "\n";
     panel += "Clicks in Box " + IntegerToString(g_currentBox) + ": " + IntegerToString(GetClicksUsedInCurrentBox()) + " / " + IntegerToString(CLICKS_PER_BOX) + "\n";
     panel += "----------------------------------------\n";
-    panel += "Campaign: " + campaign_str + "\n";
+    panel += "Campaign: " + campaign_str + " (" + IntegerToString(g_openPositionsCount) + " pos)\n";
     panel += "Avg Entry: " + DoubleToString(g_campaignEntryPrice, 5) + "\n";
     panel += "Drawdown: " + DoubleToString(GetCurrentDrawdownPips(), 1) + " pips\n";
     panel += "----------------------------------------\n";
+    panel += "Session P/L: " + (current_pnl >= 0 ? "+" : "") + DoubleToString(current_pnl, 2) + "\n";
+    panel += "Wins: " + IntegerToString(g_winningTrades) + " | Losses: " + IntegerToString(g_losingTrades) + "\n";
+    panel += "----------------------------------------\n";
     panel += "Box Top: " + DoubleToString(g_lastBoxTop, 5) + " (SELL)\n";
     panel += "Box Bottom: " + DoubleToString(g_lastBoxBottom, 5) + " (BUY)\n";
-    panel += "----------------------------------------\n";
-    panel += "Lot Size: " + DoubleToString(CalculateLotSize(), 2) + "\n";
-    panel += "Session Trades: " + IntegerToString(g_totalTrades) + "\n";
-    panel += "Wins: " + IntegerToString(g_winningTrades) + " | Losses: " + IntegerToString(g_losingTrades) + "\n";
     
     Comment(panel);
 }
