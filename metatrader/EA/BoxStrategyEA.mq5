@@ -1,14 +1,14 @@
 //+------------------------------------------------------------------+
 //|                                              BoxStrategyEA.mq5  |
-//|                                   Box Strategy EA - Phase 1 MVP |
+//|                                   Box Strategy EA - Phase 2 MVP |
 //|                               Based on EA_SPECIFICATION.md v1.6 |
 //+------------------------------------------------------------------+
 #property copyright "Box Strategy EA"
 #property link      "https://github.com/p99agent/box_strategy"
-#property version   "1.30"
-#property description "Box Strategy Scalping EA - Phase 1 MVP v1.3"
+#property version   "1.40"
+#property description "Box Strategy Scalping EA - Phase 2 MVP v1.4"
 #property description "EUR/USD | 10:00-12:00 ET | 9 pips box | 3 pips target"
-#property description "v1.3: Added RECYCLE mode (reset clicks when flat + profit)"
+#property description "v1.4: Bias detection + Dynamic box stacking"
 
 //+------------------------------------------------------------------+
 //| Includes                                                          |
@@ -46,11 +46,17 @@
 #define ENTRY_LINE_PREFIX   "BoxEA_Entry_"
 
 //+------------------------------------------------------------------+
-//| Click Mode Enum (v1.3)                                            |
+//| Enums (v1.3 + v1.4)                                               |
 //+------------------------------------------------------------------+
 enum ENUM_CLICK_MODE {
     CLICK_MODE_SESSION,   // SESSION: Fixed budget (16/day max)
     CLICK_MODE_RECYCLE    // RECYCLE: Reset when flat + profit
+};
+
+enum ENUM_BIAS {
+    BIAS_BULLISH,         // Bullish: HH + HL structure
+    BIAS_BEARISH,         // Bearish: LH + LL structure
+    BIAS_RANGING          // Ranging: Mixed or ADR exhausted
 };
 
 //+------------------------------------------------------------------+
@@ -77,6 +83,14 @@ input bool     InpStrictMVP = true;       // Block trading on non-EURUSD (MVP mo
 input group "=== Click Mode (v1.3) ==="
 input ENUM_CLICK_MODE InpClickMode = CLICK_MODE_RECYCLE;  // Click budget mode
 
+input group "=== Bias Detection (v1.4) ==="
+input bool     InpUseBias = true;         // Enable bias filtering
+input int      InpADRPeriod = 20;         // ADR calculation period (days)
+input double   InpADRThreshold = 0.80;    // ADR exhaustion threshold (80%)
+
+input group "=== Box Stacking (v1.4) ==="
+input bool     InpDynamicBoxes = true;    // Enable dynamic box stacking
+
 //+------------------------------------------------------------------+
 //| Global Variables                                                  |
 //+------------------------------------------------------------------+
@@ -100,10 +114,12 @@ double         g_campaignLots = 0;       // Total lots in campaign
 double         g_lastBoxTop = 0;
 double         g_lastBoxBottom = 0;
 datetime       g_lastBoxTime = 0;
+int            g_boxStackCount = 1;      // v1.4: How many times box has stacked
+bool           g_boxInitialized = false; // v1.4: Flag to track if box edges are initialized
 
-// THROTTLE: Prevent rapid-fire entries (v1.2 FIX)
-datetime       g_lastTradeBar = 0;       // Last bar we traded on
-datetime       g_lastLogTime = 0;        // Last time we logged a block message
+// THROTTLE: Prevent rapid-fire entries
+datetime       g_lastTradeBar = 0;
+datetime       g_lastLogTime = 0;
 
 // Statistics
 int            g_totalTrades = 0;
@@ -111,8 +127,22 @@ int            g_winningTrades = 0;
 int            g_losingTrades = 0;
 double         g_totalPipsGained = 0;
 double         g_totalPipsLost = 0;
-double         g_sessionPnL = 0;          // Session P/L for recycle logic (v1.3)
-int            g_openPositionsCount = 0;  // Track number of open positions
+double         g_sessionPnL = 0;
+int            g_openPositionsCount = 0;
+
+// v1.4: Bias state (cached, updated once per D1 bar)
+ENUM_BIAS      g_currentBias = BIAS_RANGING;
+datetime       g_lastBiasUpdate = 0;
+double         g_adrPips = 0;
+double         g_adrUsedPips = 0;
+double         g_adrRemainingPips = 0;
+double         g_adrRatio = 0;
+bool           g_adrExhausted = false;
+
+// v1.4: Hourly range (cached, updated once per H1 bar)
+double         g_hourlyHigh = 0;
+double         g_hourlyLow = 0;
+datetime       g_lastHourlyUpdate = 0;
 
 //+------------------------------------------------------------------+
 //| Helper Functions - SPEC-001: Pip Size                            |
@@ -122,8 +152,6 @@ double GetPipSize()
     int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
     double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
     
-    // 3-digit (JPY) or 5-digit (EUR/USD) = multiply by 10
-    // 2-digit or 4-digit = use as-is
     if (digits == 3 || digits == 5)
         return point * 10;
     else
@@ -162,7 +190,7 @@ bool IsInSession()
     
     if (start < end)
         return (current_hour >= start && current_hour < end);
-    else  // Crosses midnight
+    else
         return (current_hour >= start || current_hour < end);
 }
 
@@ -181,7 +209,7 @@ bool IsNewSession()
 }
 
 //+------------------------------------------------------------------+
-//| Persistence Functions (persist across restarts)                   |
+//| Persistence Functions                                             |
 //+------------------------------------------------------------------+
 void SaveStateToGlobalVariables()
 {
@@ -230,12 +258,24 @@ void ResetSessionCounters()
     g_sessionPnL = 0;
     g_openPositionsCount = 0;
     
+    // v1.4: Reset box stacking state
+    g_boxStackCount = 1;
+    g_boxInitialized = false;
+    g_lastBoxTop = 0;
+    g_lastBoxBottom = 0;
+    
+    // v1.4: Reset bias cache to force recalculation
+    g_lastBiasUpdate = 0;
+    g_lastHourlyUpdate = 0;
+    
     SaveStateToGlobalVariables();
     
     Print("=== NEW SESSION STARTED ===");
     Print("Session Start Equity: ", g_sessionStartEquity);
     Print("Broker Session Hours: ", GetBrokerSessionStart(), ":00 - ", GetBrokerSessionEnd(), ":00");
     Print("Click Mode: ", (InpClickMode == CLICK_MODE_RECYCLE ? "RECYCLE" : "SESSION"));
+    Print("Bias Detection: ", (InpUseBias ? "ON" : "OFF"));
+    Print("Dynamic Boxes: ", (InpDynamicBoxes ? "ON" : "OFF"));
 }
 
 //+------------------------------------------------------------------+
@@ -243,20 +283,21 @@ void ResetSessionCounters()
 //+------------------------------------------------------------------+
 void CheckClickRecycle()
 {
-    // Only recycle if RECYCLE mode is enabled
     if (InpClickMode != CLICK_MODE_RECYCLE)
         return;
     
-    // Calculate current session P/L
     double current_equity = AccountInfoDouble(ACCOUNT_EQUITY);
     g_sessionPnL = current_equity - g_sessionStartEquity;
     
-    // If session is profitable (or break-even), reset clicks
     if (g_sessionPnL >= 0)
     {
         int old_clicks = g_sessionClicksUsed;
         g_sessionClicksUsed = 0;
-        g_currentBox = 1;  // Also reset box level since no drawdown
+        g_currentBox = 1;
+        
+        // v1.4: Also reset box for new campaign
+        g_boxInitialized = false;
+        g_boxStackCount = 1;
         
         SaveStateToGlobalVariables();
         
@@ -277,27 +318,125 @@ void CheckClickRecycle()
 double CalculateLotSize()
 {
     double pip_size = GetPipSize();
-    
-    // Calculate pip value using MT5 tick info
     double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
     double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-    double pip_value = (tick_value / tick_size) * pip_size;  // per 1.0 lot
+    double pip_value = (tick_value / tick_size) * pip_size;
     
-    // Full position sizing formula
     double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-    double risk_amount = equity * (InpRiskPercent / 100.0);  // Convert to decimal
+    double risk_amount = equity * (InpRiskPercent / 100.0);
     double risk_per_lot = MAX_STOP_PIPS * pip_value;
     double lot_size = risk_amount / risk_per_lot;
     
-    // Use SYMBOL_VOLUME_STEP for proper rounding
     double volume_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
     double volume_min = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
     double volume_max = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
     
-    lot_size = MathFloor(lot_size / volume_step) * volume_step;  // Round down to valid step
-    lot_size = MathMax(volume_min, MathMin(lot_size, volume_max));  // Clamp to limits
+    lot_size = MathFloor(lot_size / volume_step) * volume_step;
+    lot_size = MathMax(volume_min, MathMin(lot_size, volume_max));
     
     return lot_size;
+}
+
+//+------------------------------------------------------------------+
+//| v1.4: Bias Detection (SPEC-009)                                   |
+//+------------------------------------------------------------------+
+void ClearBiasState()
+{
+    // Clear stale state on early return (Reviewer feedback #1)
+    g_adrPips = 0;
+    g_adrUsedPips = 0;
+    g_adrRemainingPips = 0;
+    g_adrRatio = 0;
+    g_adrExhausted = false;
+}
+
+void UpdateDailyBias()
+{
+    if (!InpUseBias) return;
+    
+    // Only update once per D1 bar
+    datetime current_d1 = iTime(_Symbol, PERIOD_D1, 0);
+    if (current_d1 == g_lastBiasUpdate) return;
+    g_lastBiasUpdate = current_d1;
+    
+    // GUARD: Ensure sufficient history
+    int bars = Bars(_Symbol, PERIOD_D1);
+    if (bars < InpADRPeriod + 2)
+    {
+        Print("WARNING: Insufficient D1 bars (", bars, ") for bias detection");
+        ClearBiasState();
+        g_currentBias = BIAS_RANGING;
+        return;
+    }
+    
+    // Daily structure: compare today vs yesterday
+    double today_high = iHigh(_Symbol, PERIOD_D1, 0);
+    double today_low = iLow(_Symbol, PERIOD_D1, 0);
+    double yesterday_high = iHigh(_Symbol, PERIOD_D1, 1);
+    double yesterday_low = iLow(_Symbol, PERIOD_D1, 1);
+    
+    ENUM_BIAS structure;
+    if (today_high > yesterday_high && today_low > yesterday_low)
+        structure = BIAS_BULLISH;
+    else if (today_high < yesterday_high && today_low < yesterday_low)
+        structure = BIAS_BEARISH;
+    else
+        structure = BIAS_RANGING;
+    
+    // Calculate ADR
+    double pip_size = GetPipSize();
+    double total_range = 0;
+    for (int i = 1; i <= InpADRPeriod; i++)
+    {
+        total_range += iHigh(_Symbol, PERIOD_D1, i) - iLow(_Symbol, PERIOD_D1, i);
+    }
+    g_adrPips = (total_range / InpADRPeriod) / pip_size;
+    
+    // GUARD: Avoid divide-by-zero
+    if (g_adrPips <= 0)
+    {
+        ClearBiasState();
+        g_currentBias = BIAS_RANGING;
+        return;
+    }
+    
+    // Today's usage
+    g_adrUsedPips = (today_high - today_low) / pip_size;
+    g_adrRatio = g_adrUsedPips / g_adrPips;
+    g_adrRemainingPips = g_adrPips - g_adrUsedPips;
+    
+    // Check exhaustion (>threshold% or <9 pips remaining)
+    g_adrExhausted = (g_adrRatio > InpADRThreshold) || (g_adrRemainingPips < BOX_HEIGHT_PIPS);
+    
+    // Final bias: structure unless exhausted
+    g_currentBias = g_adrExhausted ? BIAS_RANGING : structure;
+    
+    Print("Daily Bias: ", EnumToString(g_currentBias), 
+          " | ADR: ", DoubleToString(g_adrPips, 1), " pips",
+          " | Used: ", DoubleToString(g_adrRatio * 100, 1), "%",
+          " | Remaining: ", DoubleToString(g_adrRemainingPips, 1), " pips");
+}
+
+//+------------------------------------------------------------------+
+//| v1.4: Hourly Range                                                |
+//+------------------------------------------------------------------+
+void UpdateHourlyRange()
+{
+    datetime current_h1 = iTime(_Symbol, PERIOD_H1, 0);
+    if (current_h1 == g_lastHourlyUpdate) return;
+    g_lastHourlyUpdate = current_h1;
+    
+    // Use completed bars (shift 1-4)
+    g_hourlyHigh = iHigh(_Symbol, PERIOD_H1, 1);
+    g_hourlyLow = iLow(_Symbol, PERIOD_H1, 1);
+    
+    for (int i = 2; i <= 4; i++)
+    {
+        double h = iHigh(_Symbol, PERIOD_H1, i);
+        double l = iLow(_Symbol, PERIOD_H1, i);
+        if (h > g_hourlyHigh) g_hourlyHigh = h;
+        if (l < g_hourlyLow) g_hourlyLow = l;
+    }
 }
 
 //+------------------------------------------------------------------+
@@ -305,7 +444,6 @@ double CalculateLotSize()
 //+------------------------------------------------------------------+
 void UpdateCampaignTracking()
 {
-    // Recalculate weighted average entry and total lots for our positions
     double total_lots = 0;
     double weighted_sum = 0;
     int direction = 0;
@@ -324,7 +462,6 @@ void UpdateCampaignTracking()
                 weighted_sum += entry * lots;
                 positions_count++;
                 
-                // Determine direction from position type
                 if (posInfo.PositionType() == POSITION_TYPE_BUY)
                     direction = 1;
                 else
@@ -333,7 +470,6 @@ void UpdateCampaignTracking()
         }
     }
     
-    // Check if we just went flat (had positions, now none)
     bool just_went_flat = (g_openPositionsCount > 0 && positions_count == 0);
     g_openPositionsCount = positions_count;
     
@@ -345,42 +481,41 @@ void UpdateCampaignTracking()
     }
     else
     {
-        // No positions - reset campaign
         g_campaignLots = 0;
         g_campaignEntryPrice = 0;
         g_campaignDirection = 0;
         
-        // v1.3: Check for click recycle when going flat
         if (just_went_flat)
         {
             CheckClickRecycle();
+            // v1.4: Reset box initialization when going flat
+            g_boxInitialized = false;
         }
     }
 }
 
 double GetCurrentDrawdownPips()
 {
-    // Calculate drawdown based on PRICE DISTANCE from campaign entry
     UpdateCampaignTracking();
     
     if (g_campaignDirection == 0 || g_campaignLots == 0)
-        return 0;  // No open positions
+        return 0;
     
     double pip_size = GetPipSize();
     double current_price;
     
-    if (g_campaignDirection == 1)  // Long campaign
+    if (g_campaignDirection == 1)
     {
         current_price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-        double price_diff = g_campaignEntryPrice - current_price;  // Negative if in profit
-        if (price_diff < 0) return 0;  // In profit, no drawdown
+        double price_diff = g_campaignEntryPrice - current_price;
+        if (price_diff < 0) return 0;
         return price_diff / pip_size;
     }
-    else  // Short campaign
+    else
     {
         current_price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-        double price_diff = current_price - g_campaignEntryPrice;  // Negative if in profit
-        if (price_diff < 0) return 0;  // In profit, no drawdown
+        double price_diff = current_price - g_campaignEntryPrice;
+        if (price_diff < 0) return 0;
         return price_diff / pip_size;
     }
 }
@@ -389,7 +524,7 @@ int CalculateCurrentBox()
 {
     double drawdown_pips = GetCurrentDrawdownPips();
     int current_box = (int)MathFloor(drawdown_pips / BOX_HEIGHT_PIPS) + 1;
-    return MathMin(current_box, MAX_BOXES + 1);  // Cap at Box 5 for ejection
+    return MathMin(current_box, MAX_BOXES + 1);
 }
 
 void UpdateBoxLevel()
@@ -413,7 +548,7 @@ void UpdateBoxLevel()
 }
 
 //+------------------------------------------------------------------+
-//| SPEC-005: Click Counter - Enforce 4 per box + persistence         |
+//| SPEC-005: Click Counter                                           |
 //+------------------------------------------------------------------+
 bool HasClicksRemaining()
 {
@@ -422,7 +557,6 @@ bool HasClicksRemaining()
 
 bool HasClicksInCurrentBox()
 {
-    // Properly calculate clicks allowed in current box
     int clicks_allowed_so_far = g_currentBox * CLICKS_PER_BOX;
     return (g_sessionClicksUsed < clicks_allowed_so_far);
 }
@@ -436,55 +570,100 @@ int GetClicksUsedInCurrentBox()
 void UseClick()
 {
     g_sessionClicksUsed++;
-    SaveStateToGlobalVariables();  // Persist immediately
+    SaveStateToGlobalVariables();
     Print("Click used. Total: ", g_sessionClicksUsed, "/", MAX_CLICKS, 
           " | Box ", g_currentBox, ": ", GetClicksUsedInCurrentBox(), "/", CLICKS_PER_BOX);
 }
 
 //+------------------------------------------------------------------+
-//| SPEC-006: Entry Logic - Box Edge Detection                        |
+//| v1.4: Dynamic Box Stacking (SPEC-006 Enhanced)                    |
 //+------------------------------------------------------------------+
-void UpdateBoxEdges()
+void InitializeBoxEdges()
 {
-    // Calculate current box edges based on recent price action
+    // Called at session start or when going flat
     double pip_size = GetPipSize();
-    double box_height_price = BOX_HEIGHT_PIPS * pip_size;
+    double box_height = BOX_HEIGHT_PIPS * pip_size;
     
-    // Get recent high/low for box placement
+    // Get recent range
     double recent_high = iHigh(_Symbol, PERIOD_M1, iHighest(_Symbol, PERIOD_M1, MODE_HIGH, BOX_DURATION_BARS, 0));
     double recent_low = iLow(_Symbol, PERIOD_M1, iLowest(_Symbol, PERIOD_M1, MODE_LOW, BOX_DURATION_BARS, 0));
+    double current_price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
     
-    double range = recent_high - recent_low;
-    double mid = (recent_high + recent_low) / 2;
+    // Reviewer feedback #2: Ensure current price starts inside the box
+    // Find the box level that contains current price
+    int box_level = (int)MathFloor((recent_high - current_price) / box_height);
+    box_level = MathMax(0, box_level);  // Ensure non-negative
     
-    // If range is less than box height, center the box on the range
-    if (range < box_height_price)
+    g_lastBoxTop = recent_high - (box_level * box_height);
+    g_lastBoxBottom = g_lastBoxTop - box_height;
+    
+    // Ensure current price is inside the box
+    if (current_price > g_lastBoxTop)
     {
-        g_lastBoxTop = mid + (box_height_price / 2);
-        g_lastBoxBottom = mid - (box_height_price / 2);
+        g_lastBoxTop = current_price + (box_height / 2);
+        g_lastBoxBottom = g_lastBoxTop - box_height;
     }
-    else
+    else if (current_price < g_lastBoxBottom)
     {
-        // Multiple boxes in range - use the nearest edges
-        double current_price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-        
-        // Find which box level we're in
-        int box_level = (int)MathFloor((recent_high - current_price) / box_height_price);
-        g_lastBoxTop = recent_high - (box_level * box_height_price);
-        g_lastBoxBottom = g_lastBoxTop - box_height_price;
+        g_lastBoxBottom = current_price - (box_height / 2);
+        g_lastBoxTop = g_lastBoxBottom + box_height;
     }
     
+    g_boxStackCount = 1;
+    g_boxInitialized = true;
     g_lastBoxTime = TimeCurrent();
     
-    // Update visual box
-    if (InpShowBoxes)
-        DrawBoxOnChart();
+    Print("Box initialized: ", DoubleToString(g_lastBoxBottom, 5), " - ", DoubleToString(g_lastBoxTop, 5));
+}
+
+void UpdateDynamicBoxStack()
+{
+    if (!InpDynamicBoxes) return;
+    if (!g_boxInitialized) return;
+    
+    double pip_size = GetPipSize();
+    double box_height = BOX_HEIGHT_PIPS * pip_size;
+    double tolerance = 2 * pip_size;  // Whipsaw protection
+    double current_price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    
+    double break_up_level = g_lastBoxTop + tolerance;
+    double break_down_level = g_lastBoxBottom - tolerance;
+    
+    // Check for break above box top (with tolerance)
+    if (current_price > break_up_level)
+    {
+        // Reviewer feedback #5: Use break threshold in calculation
+        int boxes_to_add = (int)MathCeil((current_price - break_up_level) / box_height) + 1;
+        boxes_to_add = MathMax(1, boxes_to_add);
+        
+        double old_top = g_lastBoxTop;
+        g_lastBoxBottom = g_lastBoxTop + ((boxes_to_add - 1) * box_height);
+        g_lastBoxTop = g_lastBoxBottom + box_height;
+        g_boxStackCount += boxes_to_add;
+        
+        Print("Box stacked UP x", boxes_to_add, ": ", DoubleToString(old_top, 5), " -> ", 
+              DoubleToString(g_lastBoxBottom, 5), " - ", DoubleToString(g_lastBoxTop, 5));
+    }
+    // Check for break below box bottom (with tolerance)
+    else if (current_price < break_down_level)
+    {
+        int boxes_to_add = (int)MathCeil((break_down_level - current_price) / box_height) + 1;
+        boxes_to_add = MathMax(1, boxes_to_add);
+        
+        double old_bottom = g_lastBoxBottom;
+        g_lastBoxTop = g_lastBoxBottom - ((boxes_to_add - 1) * box_height);
+        g_lastBoxBottom = g_lastBoxTop - box_height;
+        g_boxStackCount += boxes_to_add;
+        
+        Print("Box stacked DOWN x", boxes_to_add, ": ", DoubleToString(old_bottom, 5), " -> ", 
+              DoubleToString(g_lastBoxBottom, 5), " - ", DoubleToString(g_lastBoxTop, 5));
+    }
 }
 
 bool IsPriceAtBoxTop()
 {
     double pip_size = GetPipSize();
-    double tolerance = 2 * pip_size;  // 2 pip tolerance
+    double tolerance = 2 * pip_size;
     double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
     
     return (bid >= g_lastBoxTop - tolerance && bid <= g_lastBoxTop + tolerance);
@@ -493,41 +672,62 @@ bool IsPriceAtBoxTop()
 bool IsPriceAtBoxBottom()
 {
     double pip_size = GetPipSize();
-    double tolerance = 2 * pip_size;  // 2 pip tolerance
+    double tolerance = 2 * pip_size;
     double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
     
     return (bid >= g_lastBoxBottom - tolerance && bid <= g_lastBoxBottom + tolerance);
 }
 
+//+------------------------------------------------------------------+
+//| v1.4: Entry Signal with Bias Filtering (SPEC-006 + SPEC-009)      |
+//+------------------------------------------------------------------+
 int GetEntrySignal()
 {
-    // Check if price is at a box edge
+    // v1.4: Campaign-aware entry (Reviewer feedback #2)
+    // When in a campaign: only allow adds in same direction
+    if (g_campaignDirection != 0)
+    {
+        if (g_campaignDirection == 1 && IsPriceAtBoxBottom())
+            return 1;  // Add to long campaign
+        
+        if (g_campaignDirection == -1 && IsPriceAtBoxTop())
+            return -1;  // Add to short campaign
+        
+        return 0;  // No opposite direction trades in active campaign
+    }
+    
+    // FLAT: Use bias to decide new campaign direction
     if (IsPriceAtBoxBottom())
     {
-        // At box bottom - potential BUY (if no existing short campaign)
-        if (g_campaignDirection != -1)  // Not in a short campaign
-            return 1;  // Buy signal
+        if (!InpUseBias)
+            return 1;  // No bias filtering - always allow
+        
+        // Bullish or Ranging: can start long campaign
+        if (g_currentBias == BIAS_BULLISH || g_currentBias == BIAS_RANGING)
+            return 1;
+        
+        // Bearish: don't buy against trend
+        return 0;
     }
     
     if (IsPriceAtBoxTop())
     {
-        // At box top - potential SELL (if no existing long campaign)
-        if (g_campaignDirection != 1)  // Not in a long campaign
-            return -1;  // Sell signal
+        if (!InpUseBias)
+            return -1;  // No bias filtering - always allow
+        
+        // Bearish or Ranging: can start short campaign
+        if (g_currentBias == BIAS_BEARISH || g_currentBias == BIAS_RANGING)
+            return -1;
+        
+        // Bullish: don't sell against trend
+        return 0;
     }
     
-    // If in a campaign, allow adding at box edges in same direction
-    if (g_campaignDirection == 1 && IsPriceAtBoxBottom())
-        return 1;  // Add to long campaign
-    
-    if (g_campaignDirection == -1 && IsPriceAtBoxTop())
-        return -1;  // Add to short campaign
-    
-    return 0;  // No signal
+    return 0;
 }
 
 //+------------------------------------------------------------------+
-//| THROTTLE: One trade per M1 bar (v1.2 FIX)                         |
+//| Throttle and Trade Gates                                          |
 //+------------------------------------------------------------------+
 bool IsNewBar()
 {
@@ -540,12 +740,8 @@ void MarkBarAsTraded()
     g_lastTradeBar = iTime(_Symbol, PERIOD_M1, 0);
 }
 
-//+------------------------------------------------------------------+
-//| LOG RATE LIMIT: Avoid spam (v1.2 FIX)                             |
-//+------------------------------------------------------------------+
 void LogBlockedTrade(string reason)
 {
-    // Only log once per 30 seconds to avoid spam
     if (TimeCurrent() - g_lastLogTime >= 30)
     {
         Print(reason);
@@ -555,7 +751,6 @@ void LogBlockedTrade(string reason)
 
 bool CanOpenNewTrade()
 {
-    // Check symbol constraint
     if (InpStrictMVP && _Symbol != MVP_SYMBOL)
     {
         static bool warned = false;
@@ -567,27 +762,10 @@ bool CanOpenNewTrade()
         return false;
     }
     
-    // Check all conditions
-    if (!g_tradingEnabled)
-    {
-        return false;
-    }
-    
-    if (!IsInSession())
-    {
-        return false;  // Silent - outside session
-    }
-    
-    if (g_ejectionTriggered)
-    {
-        return false;
-    }
-    
-    // v1.2 FIX: Throttle - only one trade per M1 bar
-    if (!IsNewBar())
-    {
-        return false;  // Silent - already traded this bar
-    }
+    if (!g_tradingEnabled) return false;
+    if (!IsInSession()) return false;
+    if (g_ejectionTriggered) return false;
+    if (!IsNewBar()) return false;
     
     if (!HasClicksRemaining())
     {
@@ -595,17 +773,13 @@ bool CanOpenNewTrade()
         return false;
     }
     
-    // Enforce 4 clicks per box
     if (!HasClicksInCurrentBox())
     {
         LogBlockedTrade("Max clicks in Box " + IntegerToString(g_currentBox) + " reached: " + IntegerToString(GetClicksUsedInCurrentBox()));
         return false;
     }
     
-    if (g_currentBox > MAX_BOXES)
-    {
-        return false;
-    }
+    if (g_currentBox > MAX_BOXES) return false;
     
     return true;
 }
@@ -626,7 +800,7 @@ bool OpenBuyTrade()
     if (trade.Buy(lot_size, _Symbol, ask, sl, tp, "BoxEA Buy"))
     {
         UseClick();
-        MarkBarAsTraded();  // v1.2: Mark this bar as traded
+        MarkBarAsTraded();
         g_totalTrades++;
         Print("BUY opened: ", lot_size, " lots @ ", ask, " SL: ", sl, " TP: ", tp);
         UpdateCampaignTracking();
@@ -656,7 +830,7 @@ bool OpenSellTrade()
     if (trade.Sell(lot_size, _Symbol, bid, sl, tp, "BoxEA Sell"))
     {
         UseClick();
-        MarkBarAsTraded();  // v1.2: Mark this bar as traded
+        MarkBarAsTraded();
         g_totalTrades++;
         Print("SELL opened: ", lot_size, " lots @ ", bid, " SL: ", sl, " TP: ", tp);
         UpdateCampaignTracking();
@@ -671,7 +845,7 @@ bool OpenSellTrade()
 }
 
 //+------------------------------------------------------------------+
-//| SPEC-007 & SPEC-008: Exit Logic (TP and SL)                       |
+//| SPEC-007 & SPEC-008: Exit Logic                                   |
 //+------------------------------------------------------------------+
 void TriggerEjection()
 {
@@ -703,22 +877,18 @@ void CloseAllPositions()
 }
 
 //+------------------------------------------------------------------+
-//| SPEC-013: Visual Box Indicator (v1.2 NEW)                         |
+//| Visual Box Indicator                                              |
 //+------------------------------------------------------------------+
 void DrawBoxOnChart()
 {
     if (!InpShowBoxes) return;
     
     string box_name = BOX_OBJ_PREFIX + "Current";
-    
-    // Delete old box
     ObjectDelete(0, box_name);
     
-    // Draw box from BOX_DURATION_BARS ago to now
     datetime start_time = iTime(_Symbol, PERIOD_M1, BOX_DURATION_BARS);
-    datetime end_time = TimeCurrent() + 300;  // Extend 5 minutes into future
+    datetime end_time = TimeCurrent() + 300;
     
-    // Create rectangle
     if (ObjectCreate(0, box_name, OBJ_RECTANGLE, 0, start_time, g_lastBoxTop, end_time, g_lastBoxBottom))
     {
         ObjectSetInteger(0, box_name, OBJPROP_COLOR, InpBoxColor);
@@ -729,7 +899,6 @@ void DrawBoxOnChart()
         ObjectSetInteger(0, box_name, OBJPROP_SELECTABLE, false);
     }
     
-    // Draw box top line (sell zone)
     string top_name = BOX_OBJ_PREFIX + "Top";
     ObjectDelete(0, top_name);
     if (ObjectCreate(0, top_name, OBJ_HLINE, 0, 0, g_lastBoxTop))
@@ -740,7 +909,6 @@ void DrawBoxOnChart()
         ObjectSetString(0, top_name, OBJPROP_TEXT, "Box Top (Sell Zone)");
     }
     
-    // Draw box bottom line (buy zone)
     string bottom_name = BOX_OBJ_PREFIX + "Bottom";
     ObjectDelete(0, bottom_name);
     if (ObjectCreate(0, bottom_name, OBJ_HLINE, 0, 0, g_lastBoxBottom))
@@ -770,7 +938,6 @@ void DrawEntryLine(double price, bool isBuy)
 
 void CleanupChartObjects()
 {
-    // Delete all BoxEA objects
     int total = ObjectsTotal(0);
     for (int i = total - 1; i >= 0; i--)
     {
@@ -783,7 +950,7 @@ void CleanupChartObjects()
 }
 
 //+------------------------------------------------------------------+
-//| Display Panel                                                      |
+//| Display Panel (v1.4 Enhanced)                                     |
 //+------------------------------------------------------------------+
 void UpdateInfoPanel()
 {
@@ -794,33 +961,44 @@ void UpdateInfoPanel()
     string campaign_str = (g_campaignDirection == 1) ? "LONG" : 
                           (g_campaignDirection == -1) ? "SHORT" : "NONE";
     string click_mode_str = (InpClickMode == CLICK_MODE_RECYCLE) ? "RECYCLE" : "SESSION";
+    string bias_str = (g_currentBias == BIAS_BULLISH) ? "BULLISH ^" :
+                      (g_currentBias == BIAS_BEARISH) ? "BEARISH v" : "RANGING -";
     
-    // Calculate current session P/L
     double current_pnl = AccountInfoDouble(ACCOUNT_EQUITY) - g_sessionStartEquity;
     
-    // Build panel string (MQL5 Comment() has parameter limit)
     string panel = "";
-    panel += "=== BOX STRATEGY EA v1.3 (MVP) ===\n";
-    panel += "Symbol: " + _Symbol + " | TF: " + EnumToString(Period()) + "\n";
-    panel += "Click Mode: " + click_mode_str + "\n";
+    panel += "=== BOX STRATEGY EA v1.4 ===\n";
+    panel += "Symbol: " + _Symbol + " | Mode: " + click_mode_str + "\n";
     panel += "----------------------------------------\n";
+    
+    // v1.4: Bias info
+    if (InpUseBias)
+    {
+        panel += "Bias: " + bias_str;
+        if (g_adrPips > 0)
+            panel += " (ADR: " + DoubleToString(g_adrRatio * 100, 0) + "% | " + 
+                     DoubleToString(g_adrRemainingPips, 1) + " left)\n";
+        else
+            panel += "\n";
+    }
+    
     panel += "Session: " + session_status + " (" + IntegerToString(GetBrokerSessionStart()) + ":00-" + IntegerToString(GetBrokerSessionEnd()) + ":00)\n";
-    panel += "Trading: " + trading_status + "\n";
     panel += "----------------------------------------\n";
     panel += "Current Box: " + IntegerToString(g_currentBox) + " / " + IntegerToString(MAX_BOXES) + "\n";
-    panel += "Clicks Used: " + IntegerToString(g_sessionClicksUsed) + " / " + IntegerToString(MAX_CLICKS) + "\n";
-    panel += "Clicks in Box " + IntegerToString(g_currentBox) + ": " + IntegerToString(GetClicksUsedInCurrentBox()) + " / " + IntegerToString(CLICKS_PER_BOX) + "\n";
+    panel += "Clicks: " + IntegerToString(g_sessionClicksUsed) + "/" + IntegerToString(MAX_CLICKS) + 
+             " (Box " + IntegerToString(g_currentBox) + ": " + IntegerToString(GetClicksUsedInCurrentBox()) + "/" + IntegerToString(CLICKS_PER_BOX) + ")\n";
     panel += "----------------------------------------\n";
     panel += "Campaign: " + campaign_str + " (" + IntegerToString(g_openPositionsCount) + " pos)\n";
-    panel += "Avg Entry: " + DoubleToString(g_campaignEntryPrice, 5) + "\n";
     panel += "Drawdown: " + DoubleToString(GetCurrentDrawdownPips(), 1) + " pips\n";
     panel += "----------------------------------------\n";
     panel += "Session P/L: " + (current_pnl >= 0 ? "+" : "") + DoubleToString(current_pnl, 2) + "\n";
-    panel += "Trades: " + IntegerToString(g_totalTrades) + " | Wins: " + IntegerToString(g_winningTrades) + " | Losses: " + IntegerToString(g_losingTrades) + "\n";
-    panel += "Lot Size: " + DoubleToString(CalculateLotSize(), 2) + "\n";
+    panel += "Trades: " + IntegerToString(g_totalTrades) + " | W: " + IntegerToString(g_winningTrades) + " L: " + IntegerToString(g_losingTrades) + "\n";
     panel += "----------------------------------------\n";
-    panel += "Box Top: " + DoubleToString(g_lastBoxTop, 5) + " (SELL)\n";
-    panel += "Box Bottom: " + DoubleToString(g_lastBoxBottom, 5) + " (BUY)\n";
+    
+    // v1.4: Box stacking info
+    string box_mode = InpDynamicBoxes ? "[Dynamic x" + IntegerToString(g_boxStackCount) + "]" : "[Static]";
+    panel += "Box " + box_mode + ": " + DoubleToString(g_lastBoxBottom, 5) + " - " + DoubleToString(g_lastBoxTop, 5) + "\n";
+    panel += "Lot: " + DoubleToString(CalculateLotSize(), 2) + "\n";
     
     Comment(panel);
 }
@@ -847,42 +1025,34 @@ ENUM_ORDER_TYPE_FILLING GetFillingMode()
 int OnInit()
 {
     Print("==============================================");
-    Print("Box Strategy EA v1.3 - Phase 1 MVP");
+    Print("Box Strategy EA v1.4 - Phase 2 MVP");
     Print("==============================================");
     
-    // Validate symbol
     if (_Symbol != MVP_SYMBOL)
     {
         if (InpStrictMVP)
         {
             Print("ERROR: This EA is locked to ", MVP_SYMBOL, " in strict MVP mode");
             Print("Current symbol: ", _Symbol);
-            Print("Either change to EURUSD or disable Strict MVP mode");
             return(INIT_FAILED);
         }
         else
         {
             Print("WARNING: This EA is optimized for ", MVP_SYMBOL);
-            Print("Current symbol: ", _Symbol);
         }
     }
     
-    // Validate timeframe
     if (Period() != PERIOD_M1)
     {
         Print("WARNING: This EA is optimized for M1 timeframe");
-        Print("Current timeframe: ", EnumToString(Period()));
     }
     
-    // Initialize trade object with proper filling mode
     trade.SetExpertMagicNumber(InpMagicNumber);
     trade.SetDeviationInPoints(10);
     trade.SetTypeFilling(GetFillingMode());
     
-    // Load persisted state
     LoadStateFromGlobalVariables();
     
-    // Check if new session
     if (IsNewSession())
     {
         ResetSessionCounters();
@@ -891,38 +1061,41 @@ int OnInit()
     {
         Print("Resuming session. Clicks used: ", g_sessionClicksUsed);
         
-        // v1.3 FIX: Startup recycle check when already flat + profitable
+        // v1.3 FIX: Startup recycle check
         if (InpClickMode == CLICK_MODE_RECYCLE && g_sessionClicksUsed > 0)
         {
             UpdateCampaignTracking();
             if (g_openPositionsCount == 0 && g_sessionClicksUsed > 0)
             {
-                // We're flat but have used clicks - check for recycle
                 double current_pnl = AccountInfoDouble(ACCOUNT_EQUITY) - g_sessionStartEquity;
                 if (current_pnl >= 0)
                 {
                     Print("Startup recycle: Flat + profitable, resetting clicks");
                     g_sessionClicksUsed = 0;
                     g_currentBox = 1;
+                    g_boxInitialized = false;
                     SaveStateToGlobalVariables();
                 }
             }
         }
     }
     
-    // Initialize box edges
-    UpdateBoxEdges();
+    // v1.4: Initialize bias
+    if (InpUseBias)
+    {
+        UpdateDailyBias();
+    }
     
-    // Display settings
-    Print("Broker Session: ", GetBrokerSessionStart(), ":00 - ", GetBrokerSessionEnd(), ":00 (server time)");
+    // v1.4: Initialize hourly range
+    UpdateHourlyRange();
+    
+    Print("Broker Session: ", GetBrokerSessionStart(), ":00 - ", GetBrokerSessionEnd(), ":00");
     Print("Lot Size: ", CalculateLotSize());
     Print("Pip Size: ", GetPipSize());
     Print("Filling Mode: ", EnumToString(GetFillingMode()));
-    Print("Max Stop: ", MAX_STOP_PIPS, " pips");
-    Print("Take Profit: ", TAKE_PROFIT_PIPS, " pips");
-    Print("Entry Throttle: 1 trade per M1 bar");
     Print("Click Mode: ", (InpClickMode == CLICK_MODE_RECYCLE ? "RECYCLE" : "SESSION"));
-    Print("Box Visualization: ", (InpShowBoxes ? "ON" : "OFF"));
+    Print("Bias Detection: ", (InpUseBias ? "ON" : "OFF"));
+    Print("Dynamic Boxes: ", (InpDynamicBoxes ? "ON" : "OFF"));
     Print("==============================================");
     
     return(INIT_SUCCEEDED);
@@ -933,9 +1106,9 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-    SaveStateToGlobalVariables();  // Save state on exit
-    CleanupChartObjects();         // Remove visual objects
-    Comment("");                   // Clear panel
+    SaveStateToGlobalVariables();
+    CleanupChartObjects();
+    Comment("");
     Print("Box Strategy EA stopped. State saved. Reason: ", reason);
 }
 
@@ -944,64 +1117,80 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-    // Check for new session (daily reset)
+    // 1. Session check
     if (IsNewSession())
     {
         ResetSessionCounters();
     }
     
-    // Update campaign tracking
+    // 2. v1.4: Update bias (once per D1 bar)
+    if (InpUseBias)
+    {
+        UpdateDailyBias();
+    }
+    
+    // 3. v1.4: Update hourly range (once per H1 bar)
+    UpdateHourlyRange();
+    
+    // 4. Update campaign tracking
     UpdateCampaignTracking();
     
-    // Update box level based on drawdown
-    UpdateBoxLevel();
+    // 5. v1.4: Initialize box if needed (Reviewer feedback #3)
+    if (!g_boxInitialized)
+    {
+        InitializeBoxEdges();
+    }
     
-    // Check for ejection
+    // 6. v1.4: Dynamic box stacking (if enabled)
+    if (InpDynamicBoxes)
+    {
+        UpdateDynamicBoxStack();
+    }
+    
+    // 7. Update box level and ejection check
+    UpdateBoxLevel();
     if (g_currentBox > MAX_BOXES && !g_ejectionTriggered)
     {
         TriggerEjection();
     }
     
-    // Update display
+    // 8. Update visual (on new bars only to reduce overhead)
+    static datetime last_visual_update = 0;
+    datetime current_bar = iTime(_Symbol, PERIOD_M1, 0);
+    if (current_bar != last_visual_update)
+    {
+        DrawBoxOnChart();
+        last_visual_update = current_bar;
+    }
+    
+    // 9. Update display
     UpdateInfoPanel();
     
-    // Only process entries if in session and trading enabled
+    // 10. Entry signals
     if (!IsInSession() || !g_tradingEnabled || g_ejectionTriggered)
         return;
     
-    // Update box edges periodically (every new bar)
-    static datetime last_bar = 0;
-    datetime current_bar = iTime(_Symbol, PERIOD_M1, 0);
-    if (current_bar != last_bar)
-    {
-        UpdateBoxEdges();
-        last_bar = current_bar;
-    }
-    
-    // Check entry signals
     int signal = GetEntrySignal();
     
-    if (signal == 1)  // Buy signal
+    if (signal == 1)
     {
         OpenBuyTrade();
     }
-    else if (signal == -1)  // Sell signal
+    else if (signal == -1)
     {
         OpenSellTrade();
     }
 }
 
 //+------------------------------------------------------------------+
-//| Trade transaction handler - Track win/loss stats                  |
+//| Trade transaction handler                                         |
 //+------------------------------------------------------------------+
 void OnTradeTransaction(const MqlTradeTransaction& trans,
                         const MqlTradeRequest& request,
                         const MqlTradeResult& result)
 {
-    // Track closed trades for statistics
     if (trans.type == TRADE_TRANSACTION_HISTORY_ADD)
     {
-        // A deal was added to history - check if it's a close
         ulong deal_ticket = trans.deal;
         
         if (deal_ticket > 0)
@@ -1013,7 +1202,6 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
                 
                 if (magic == InpMagicNumber && entry == DEAL_ENTRY_OUT)
                 {
-                    // This is a closing deal for our EA
                     double profit = HistoryDealGetDouble(deal_ticket, DEAL_PROFIT);
                     double commission = HistoryDealGetDouble(deal_ticket, DEAL_COMMISSION);
                     double swap = HistoryDealGetDouble(deal_ticket, DEAL_SWAP);
@@ -1030,7 +1218,6 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
                         Print("Trade closed: LOSS ", DoubleToString(net_profit, 2));
                     }
                     
-                    // Update campaign after close
                     UpdateCampaignTracking();
                 }
             }
