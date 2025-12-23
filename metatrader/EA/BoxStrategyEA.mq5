@@ -5,9 +5,10 @@
 //+------------------------------------------------------------------+
 #property copyright "Box Strategy EA"
 #property link      "https://github.com/p99agent/box_strategy"
-#property version   "1.00"
-#property description "Box Strategy Scalping EA - Phase 1 MVP"
+#property version   "1.10"
+#property description "Box Strategy Scalping EA - Phase 1 MVP v1.1"
 #property description "EUR/USD | 10:00-12:00 ET | 9 pips box | 3 pips target"
+#property description "v1.1: Fixed drawdown calc, box edge entry, persistence"
 
 //+------------------------------------------------------------------+
 //| Includes                                                          |
@@ -32,6 +33,14 @@
 #define CLICKS_PER_BOX      4
 #define RISK_PER_CLICK      0.0025      // 0.25%
 
+// Global variable keys for persistence
+#define GV_CLICKS_USED      "BoxEA_ClicksUsed"
+#define GV_SESSION_DATE     "BoxEA_SessionDate"
+#define GV_START_EQUITY     "BoxEA_StartEquity"
+#define GV_EJECTION         "BoxEA_Ejection"
+#define GV_CAMPAIGN_DIR     "BoxEA_CampaignDirection"
+#define GV_CAMPAIGN_ENTRY   "BoxEA_CampaignEntry"
+
 //+------------------------------------------------------------------+
 //| Input Parameters                                                  |
 //+------------------------------------------------------------------+
@@ -48,13 +57,16 @@ input bool     InpShowPanel = true;       // Show info panel on chart
 input color    InpBuyColor = clrLime;     // Buy arrow color
 input color    InpSellColor = clrRed;     // Sell arrow color
 
+input group "=== Safety Settings ==="
+input bool     InpStrictMVP = true;       // Block trading on non-EURUSD (MVP mode)
+
 //+------------------------------------------------------------------+
 //| Global Variables                                                  |
 //+------------------------------------------------------------------+
 CTrade         trade;
 CPositionInfo  posInfo;
 
-// Session tracking
+// Session tracking (PERSISTENT - loaded from GlobalVariables)
 int            g_sessionClicksUsed = 0;
 int            g_currentBox = 1;
 double         g_sessionStartEquity = 0;
@@ -62,13 +74,20 @@ datetime       g_lastSessionDate = 0;
 bool           g_tradingEnabled = true;
 bool           g_ejectionTriggered = false;
 
-// Box calculation (for display/validation - SPEC-001)
-double         g_calculatedBoxHeight = BOX_HEIGHT_PIPS;
-int            g_calculatedBoxDuration = BOX_DURATION_BARS;
+// Campaign tracking (for proper drawdown calculation)
+int            g_campaignDirection = 0;  // 1 = long, -1 = short, 0 = none
+double         g_campaignEntryPrice = 0; // Weighted average entry
+double         g_campaignLots = 0;       // Total lots in campaign
+
+// Box edge tracking
+double         g_lastBoxTop = 0;
+double         g_lastBoxBottom = 0;
+datetime       g_lastBoxTime = 0;
 
 // Statistics
 int            g_totalTrades = 0;
 int            g_winningTrades = 0;
+int            g_losingTrades = 0;
 double         g_totalPipsGained = 0;
 double         g_totalPipsLost = 0;
 
@@ -138,6 +157,42 @@ bool IsNewSession()
     return false;
 }
 
+//+------------------------------------------------------------------+
+//| Persistence Functions (FIX #5 - persist across restarts)          |
+//+------------------------------------------------------------------+
+void SaveStateToGlobalVariables()
+{
+    GlobalVariableSet(GV_CLICKS_USED, (double)g_sessionClicksUsed);
+    GlobalVariableSet(GV_SESSION_DATE, (double)g_lastSessionDate);
+    GlobalVariableSet(GV_START_EQUITY, g_sessionStartEquity);
+    GlobalVariableSet(GV_EJECTION, g_ejectionTriggered ? 1.0 : 0.0);
+    GlobalVariableSet(GV_CAMPAIGN_DIR, (double)g_campaignDirection);
+    GlobalVariableSet(GV_CAMPAIGN_ENTRY, g_campaignEntryPrice);
+}
+
+void LoadStateFromGlobalVariables()
+{
+    if (GlobalVariableCheck(GV_CLICKS_USED))
+        g_sessionClicksUsed = (int)GlobalVariableGet(GV_CLICKS_USED);
+    
+    if (GlobalVariableCheck(GV_SESSION_DATE))
+        g_lastSessionDate = (datetime)GlobalVariableGet(GV_SESSION_DATE);
+    
+    if (GlobalVariableCheck(GV_START_EQUITY))
+        g_sessionStartEquity = GlobalVariableGet(GV_START_EQUITY);
+    
+    if (GlobalVariableCheck(GV_EJECTION))
+        g_ejectionTriggered = (GlobalVariableGet(GV_EJECTION) > 0.5);
+    
+    if (GlobalVariableCheck(GV_CAMPAIGN_DIR))
+        g_campaignDirection = (int)GlobalVariableGet(GV_CAMPAIGN_DIR);
+    
+    if (GlobalVariableCheck(GV_CAMPAIGN_ENTRY))
+        g_campaignEntryPrice = GlobalVariableGet(GV_CAMPAIGN_ENTRY);
+    
+    Print("State loaded: Clicks=", g_sessionClicksUsed, " Ejection=", g_ejectionTriggered);
+}
+
 void ResetSessionCounters()
 {
     g_sessionClicksUsed = 0;
@@ -145,6 +200,12 @@ void ResetSessionCounters()
     g_sessionStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
     g_tradingEnabled = true;
     g_ejectionTriggered = false;
+    g_campaignDirection = 0;
+    g_campaignEntryPrice = 0;
+    g_campaignLots = 0;
+    
+    SaveStateToGlobalVariables();
+    
     Print("=== NEW SESSION STARTED ===");
     Print("Session Start Equity: ", g_sessionStartEquity);
     Print("Broker Session Hours: ", GetBrokerSessionStart(), ":00 - ", GetBrokerSessionEnd(), ":00");
@@ -180,12 +241,14 @@ double CalculateLotSize()
 }
 
 //+------------------------------------------------------------------+
-//| SPEC-004: Box Counter and Tracker                                 |
+//| SPEC-004: Box Counter - FIXED: Price-based drawdown               |
 //+------------------------------------------------------------------+
-double GetCurrentDrawdownPips()
+void UpdateCampaignTracking()
 {
-    double total_drawdown = 0;
-    double pip_size = GetPipSize();
+    // Recalculate weighted average entry and total lots for our positions
+    double total_lots = 0;
+    double weighted_sum = 0;
+    int direction = 0;
     
     for (int i = PositionsTotal() - 1; i >= 0; i--)
     {
@@ -193,16 +256,63 @@ double GetCurrentDrawdownPips()
         {
             if (posInfo.Symbol() == _Symbol && posInfo.Magic() == InpMagicNumber)
             {
-                double profit_pips = posInfo.Profit() / (posInfo.Volume() * 
-                    SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE) / 
-                    SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE) * pip_size);
+                double lots = posInfo.Volume();
+                double entry = posInfo.PriceOpen();
                 
-                if (profit_pips < 0)
-                    total_drawdown += MathAbs(profit_pips);
+                total_lots += lots;
+                weighted_sum += entry * lots;
+                
+                // Determine direction from position type
+                if (posInfo.PositionType() == POSITION_TYPE_BUY)
+                    direction = 1;
+                else
+                    direction = -1;
             }
         }
     }
-    return total_drawdown;
+    
+    if (total_lots > 0)
+    {
+        g_campaignLots = total_lots;
+        g_campaignEntryPrice = weighted_sum / total_lots;
+        g_campaignDirection = direction;
+    }
+    else
+    {
+        // No positions - reset campaign
+        g_campaignLots = 0;
+        g_campaignEntryPrice = 0;
+        g_campaignDirection = 0;
+    }
+}
+
+double GetCurrentDrawdownPips()
+{
+    // FIX #1: Calculate drawdown based on PRICE DISTANCE from campaign entry
+    // NOT sum of per-position pips
+    
+    UpdateCampaignTracking();
+    
+    if (g_campaignDirection == 0 || g_campaignLots == 0)
+        return 0;  // No open positions
+    
+    double pip_size = GetPipSize();
+    double current_price;
+    
+    if (g_campaignDirection == 1)  // Long campaign
+    {
+        current_price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        double price_diff = g_campaignEntryPrice - current_price;  // Negative if in profit
+        if (price_diff < 0) return 0;  // In profit, no drawdown
+        return price_diff / pip_size;
+    }
+    else  // Short campaign
+    {
+        current_price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        double price_diff = current_price - g_campaignEntryPrice;  // Negative if in profit
+        if (price_diff < 0) return 0;  // In profit, no drawdown
+        return price_diff / pip_size;
+    }
 }
 
 int CalculateCurrentBox()
@@ -233,7 +343,7 @@ void UpdateBoxLevel()
 }
 
 //+------------------------------------------------------------------+
-//| SPEC-005: Click Counter                                           |
+//| SPEC-005: Click Counter - FIXED: Enforce 4 per box + persistence  |
 //+------------------------------------------------------------------+
 bool HasClicksRemaining()
 {
@@ -242,26 +352,131 @@ bool HasClicksRemaining()
 
 bool HasClicksInCurrentBox()
 {
-    // Each box gets 4 clicks
-    int clicks_used_in_box = g_sessionClicksUsed % CLICKS_PER_BOX;
-    return (clicks_used_in_box < CLICKS_PER_BOX);
+    // FIX #4: Properly calculate clicks allowed in current box
+    int clicks_allowed_so_far = g_currentBox * CLICKS_PER_BOX;
+    return (g_sessionClicksUsed < clicks_allowed_so_far);
+}
+
+int GetClicksUsedInCurrentBox()
+{
+    int clicks_before_this_box = (g_currentBox - 1) * CLICKS_PER_BOX;
+    return MathMax(0, g_sessionClicksUsed - clicks_before_this_box);
 }
 
 void UseClick()
 {
     g_sessionClicksUsed++;
-    Print("Click used. Total clicks: ", g_sessionClicksUsed, "/", MAX_CLICKS);
+    SaveStateToGlobalVariables();  // Persist immediately
+    Print("Click used. Total: ", g_sessionClicksUsed, "/", MAX_CLICKS, 
+          " | Box ", g_currentBox, ": ", GetClicksUsedInCurrentBox(), "/", CLICKS_PER_BOX);
 }
 
 //+------------------------------------------------------------------+
-//| SPEC-006: Entry Logic                                             |
+//| SPEC-006: Entry Logic - Box Edge Detection                        |
 //+------------------------------------------------------------------+
+void UpdateBoxEdges()
+{
+    // Calculate current box edges based on recent price action
+    // For MVP: Use the most recent swing high/low as box reference
+    
+    double pip_size = GetPipSize();
+    double box_height_price = BOX_HEIGHT_PIPS * pip_size;
+    
+    // Get recent high/low for box placement
+    double recent_high = iHigh(_Symbol, PERIOD_M1, iHighest(_Symbol, PERIOD_M1, MODE_HIGH, BOX_DURATION_BARS, 0));
+    double recent_low = iLow(_Symbol, PERIOD_M1, iLowest(_Symbol, PERIOD_M1, MODE_LOW, BOX_DURATION_BARS, 0));
+    
+    double range = recent_high - recent_low;
+    double mid = (recent_high + recent_low) / 2;
+    
+    // If range is less than box height, center the box on the range
+    if (range < box_height_price)
+    {
+        g_lastBoxTop = mid + (box_height_price / 2);
+        g_lastBoxBottom = mid - (box_height_price / 2);
+    }
+    else
+    {
+        // Multiple boxes in range - use the nearest edges
+        double current_price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        
+        // Find which box level we're in
+        int box_level = (int)MathFloor((recent_high - current_price) / box_height_price);
+        g_lastBoxTop = recent_high - (box_level * box_height_price);
+        g_lastBoxBottom = g_lastBoxTop - box_height_price;
+    }
+    
+    g_lastBoxTime = TimeCurrent();
+}
+
+bool IsPriceAtBoxTop()
+{
+    double pip_size = GetPipSize();
+    double tolerance = 2 * pip_size;  // 2 pip tolerance
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    
+    return (bid >= g_lastBoxTop - tolerance && bid <= g_lastBoxTop + tolerance);
+}
+
+bool IsPriceAtBoxBottom()
+{
+    double pip_size = GetPipSize();
+    double tolerance = 2 * pip_size;  // 2 pip tolerance
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    
+    return (bid >= g_lastBoxBottom - tolerance && bid <= g_lastBoxBottom + tolerance);
+}
+
+int GetEntrySignal()
+{
+    // FIX #2: Replace RSI with proper box edge detection
+    
+    // Update box edges
+    UpdateBoxEdges();
+    
+    // Check if price is at a box edge
+    if (IsPriceAtBoxBottom())
+    {
+        // At box bottom - potential BUY (if no existing short campaign)
+        if (g_campaignDirection != -1)  // Not in a short campaign
+            return 1;  // Buy signal
+    }
+    
+    if (IsPriceAtBoxTop())
+    {
+        // At box top - potential SELL (if no existing long campaign)
+        if (g_campaignDirection != 1)  // Not in a long campaign
+            return -1;  // Sell signal
+    }
+    
+    // If in a campaign, allow adding at box edges in same direction
+    if (g_campaignDirection == 1 && IsPriceAtBoxBottom())
+        return 1;  // Add to long campaign
+    
+    if (g_campaignDirection == -1 && IsPriceAtBoxTop())
+        return -1;  // Add to short campaign
+    
+    return 0;  // No signal
+}
+
 bool CanOpenNewTrade()
 {
+    // Check symbol constraint (FIX Warning A)
+    if (InpStrictMVP && _Symbol != MVP_SYMBOL)
+    {
+        // In strict MVP mode, block non-EURUSD
+        static bool warned = false;
+        if (!warned)
+        {
+            Print("BLOCKED: EA is in strict MVP mode (EUR/USD only). Current symbol: ", _Symbol);
+            warned = true;
+        }
+        return false;
+    }
+    
     // Check all conditions
     if (!g_tradingEnabled)
     {
-        Print("Trading disabled for this session");
         return false;
     }
     
@@ -272,7 +487,6 @@ bool CanOpenNewTrade()
     
     if (g_ejectionTriggered)
     {
-        Print("Ejection triggered - no new trades");
         return false;
     }
     
@@ -282,17 +496,16 @@ bool CanOpenNewTrade()
         return false;
     }
     
-    if (g_currentBox > MAX_BOXES)
+    // FIX #4: Enforce 4 clicks per box
+    if (!HasClicksInCurrentBox())
     {
-        Print("Beyond Box 4 - trading blocked");
+        Print("Max clicks in Box ", g_currentBox, " reached: ", GetClicksUsedInCurrentBox());
         return false;
     }
     
-    // Check if symbol matches MVP constraint
-    if (_Symbol != MVP_SYMBOL)
+    if (g_currentBox > MAX_BOXES)
     {
-        Print("WARNING: EA designed for ", MVP_SYMBOL, " only. Current: ", _Symbol);
-        // Still allow but warn
+        return false;
     }
     
     return true;
@@ -316,6 +529,7 @@ bool OpenBuyTrade()
         UseClick();
         g_totalTrades++;
         Print("BUY opened: ", lot_size, " lots @ ", ask, " SL: ", sl, " TP: ", tp);
+        UpdateCampaignTracking();
         return true;
     }
     else
@@ -343,6 +557,7 @@ bool OpenSellTrade()
         UseClick();
         g_totalTrades++;
         Print("SELL opened: ", lot_size, " lots @ ", bid, " SL: ", sl, " TP: ", tp);
+        UpdateCampaignTracking();
         return true;
     }
     else
@@ -361,6 +576,7 @@ void TriggerEjection()
     
     g_ejectionTriggered = true;
     g_tradingEnabled = false;
+    SaveStateToGlobalVariables();
     
     Alert("!!! EJECTION TRIGGERED - Closing all positions !!!");
     Print("Ejection at Box ", g_currentBox, " - Drawdown exceeded ", MAX_STOP_PIPS, " pips");
@@ -383,12 +599,6 @@ void CloseAllPositions()
     }
 }
 
-void CheckForClosedTrades()
-{
-    // This would be called in OnTradeTransaction for full implementation
-    // For MVP, we track manually or use history
-}
-
 //+------------------------------------------------------------------+
 //| Display Panel                                                      |
 //+------------------------------------------------------------------+
@@ -398,51 +608,48 @@ void UpdateInfoPanel()
     
     string session_status = IsInSession() ? "ACTIVE" : "CLOSED";
     string trading_status = g_tradingEnabled ? "ENABLED" : "DISABLED";
+    string campaign_str = (g_campaignDirection == 1) ? "LONG" : 
+                          (g_campaignDirection == -1) ? "SHORT" : "NONE";
     
     Comment(
-        "=== BOX STRATEGY EA v1.0 (MVP) ===\n",
+        "=== BOX STRATEGY EA v1.1 (MVP) ===\n",
         "Symbol: ", _Symbol, " | TF: ", EnumToString(Period()), "\n",
+        "Mode: ", (InpStrictMVP ? "STRICT MVP (EURUSD only)" : "Flexible"), "\n",
         "----------------------------------------\n",
         "Session: ", session_status, " (", GetBrokerSessionStart(), ":00-", GetBrokerSessionEnd(), ":00)\n",
         "Trading: ", trading_status, "\n",
         "----------------------------------------\n",
         "Current Box: ", g_currentBox, " / ", MAX_BOXES, "\n",
         "Clicks Used: ", g_sessionClicksUsed, " / ", MAX_CLICKS, "\n",
+        "Clicks in Box ", g_currentBox, ": ", GetClicksUsedInCurrentBox(), " / ", CLICKS_PER_BOX, "\n",
+        "----------------------------------------\n",
+        "Campaign: ", campaign_str, "\n",
+        "Avg Entry: ", DoubleToString(g_campaignEntryPrice, 5), "\n",
         "Drawdown: ", DoubleToString(GetCurrentDrawdownPips(), 1), " pips\n",
         "----------------------------------------\n",
-        "Lot Size: ", DoubleToString(CalculateLotSize(), 2), "\n",
-        "Pip Size: ", DoubleToString(GetPipSize(), 5), "\n",
+        "Box Top: ", DoubleToString(g_lastBoxTop, 5), "\n",
+        "Box Bottom: ", DoubleToString(g_lastBoxBottom, 5), "\n",
         "----------------------------------------\n",
+        "Lot Size: ", DoubleToString(CalculateLotSize(), 2), "\n",
         "Session Trades: ", g_totalTrades, "\n",
-        "Win Rate: ", (g_totalTrades > 0 ? DoubleToString((double)g_winningTrades/g_totalTrades*100, 1) : "N/A"), "%\n"
+        "Wins: ", g_winningTrades, " | Losses: ", g_losingTrades, "\n"
     );
 }
 
 //+------------------------------------------------------------------+
-//| Simple Entry Signal (placeholder for proper logic)                |
+//| Detect proper filling mode for broker                             |
 //+------------------------------------------------------------------+
-int GetEntrySignal()
+ENUM_ORDER_TYPE_FILLING GetFillingMode()
 {
-    // Basic RSI-based entry for MVP testing
-    // TODO: Replace with proper box edge detection
+    uint filling = (uint)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
     
-    double rsi[];
-    ArraySetAsSeries(rsi, true);
+    if ((filling & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
+        return ORDER_FILLING_IOC;
     
-    int rsi_handle = iRSI(_Symbol, PERIOD_M1, 14, PRICE_CLOSE);
-    if (rsi_handle == INVALID_HANDLE) return 0;
+    if ((filling & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
+        return ORDER_FILLING_FOK;
     
-    if (CopyBuffer(rsi_handle, 0, 0, 3, rsi) < 3) return 0;
-    
-    // Oversold = Buy signal
-    if (rsi[0] < 30 && rsi[1] < 30)
-        return 1;  // Buy
-    
-    // Overbought = Sell signal
-    if (rsi[0] > 70 && rsi[1] > 70)
-        return -1;  // Sell
-    
-    return 0;  // No signal
+    return ORDER_FILLING_RETURN;
 }
 
 //+------------------------------------------------------------------+
@@ -451,14 +658,24 @@ int GetEntrySignal()
 int OnInit()
 {
     Print("==============================================");
-    Print("Box Strategy EA v1.0 - Phase 1 MVP");
+    Print("Box Strategy EA v1.1 - Phase 1 MVP");
     Print("==============================================");
     
     // Validate symbol
     if (_Symbol != MVP_SYMBOL)
     {
-        Print("WARNING: This EA is optimized for ", MVP_SYMBOL);
-        Print("Current symbol: ", _Symbol);
+        if (InpStrictMVP)
+        {
+            Print("ERROR: This EA is locked to ", MVP_SYMBOL, " in strict MVP mode");
+            Print("Current symbol: ", _Symbol);
+            Print("Either change to EURUSD or disable Strict MVP mode");
+            return(INIT_FAILED);
+        }
+        else
+        {
+            Print("WARNING: This EA is optimized for ", MVP_SYMBOL);
+            Print("Current symbol: ", _Symbol);
+        }
     }
     
     // Validate timeframe
@@ -468,18 +685,32 @@ int OnInit()
         Print("Current timeframe: ", EnumToString(Period()));
     }
     
-    // Initialize trade object
+    // Initialize trade object with proper filling mode (FIX Warning B)
     trade.SetExpertMagicNumber(InpMagicNumber);
     trade.SetDeviationInPoints(10);
-    trade.SetTypeFilling(ORDER_FILLING_IOC);
+    trade.SetTypeFilling(GetFillingMode());
     
-    // Initialize session
-    ResetSessionCounters();
+    // Load persisted state
+    LoadStateFromGlobalVariables();
+    
+    // Check if new session
+    if (IsNewSession())
+    {
+        ResetSessionCounters();
+    }
+    else
+    {
+        Print("Resuming session. Clicks used: ", g_sessionClicksUsed);
+    }
+    
+    // Initialize box edges
+    UpdateBoxEdges();
     
     // Display settings
     Print("Broker Session: ", GetBrokerSessionStart(), ":00 - ", GetBrokerSessionEnd(), ":00 (server time)");
     Print("Lot Size: ", CalculateLotSize());
     Print("Pip Size: ", GetPipSize());
+    Print("Filling Mode: ", EnumToString(GetFillingMode()));
     Print("Max Stop: ", MAX_STOP_PIPS, " pips");
     Print("Take Profit: ", TAKE_PROFIT_PIPS, " pips");
     Print("==============================================");
@@ -492,8 +723,9 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+    SaveStateToGlobalVariables();  // Save state on exit
     Comment("");  // Clear panel
-    Print("Box Strategy EA stopped. Reason: ", reason);
+    Print("Box Strategy EA stopped. State saved. Reason: ", reason);
 }
 
 //+------------------------------------------------------------------+
@@ -506,6 +738,9 @@ void OnTick()
     {
         ResetSessionCounters();
     }
+    
+    // Update campaign tracking
+    UpdateCampaignTracking();
     
     // Update box level based on drawdown
     UpdateBoxLevel();
@@ -523,6 +758,14 @@ void OnTick()
     if (!IsInSession() || !g_tradingEnabled || g_ejectionTriggered)
         return;
     
+    // Update box edges periodically
+    static datetime last_box_update = 0;
+    if (TimeCurrent() - last_box_update > 60)  // Every minute
+    {
+        UpdateBoxEdges();
+        last_box_update = TimeCurrent();
+    }
+    
     // Check entry signals
     int signal = GetEntrySignal();
     
@@ -537,19 +780,52 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
-//| Trade transaction handler                                         |
+//| Trade transaction handler - Track win/loss stats                  |
 //+------------------------------------------------------------------+
 void OnTradeTransaction(const MqlTradeTransaction& trans,
                         const MqlTradeRequest& request,
                         const MqlTradeResult& result)
 {
     // Track closed trades for statistics
-    if (trans.type == TRADE_TRANSACTION_DEAL_ADD)
+    if (trans.type == TRADE_TRANSACTION_HISTORY_ADD)
     {
-        if (trans.deal_type == DEAL_TYPE_BUY || trans.deal_type == DEAL_TYPE_SELL)
+        // A deal was added to history - check if it's a close
+        ulong deal_ticket = trans.deal;
+        
+        if (deal_ticket > 0)
         {
-            // Position closed
-            // TODO: Update win/loss statistics
+            if (HistoryDealSelect(deal_ticket))
+            {
+                long magic = HistoryDealGetInteger(deal_ticket, DEAL_MAGIC);
+                ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
+                
+                if (magic == InpMagicNumber && entry == DEAL_ENTRY_OUT)
+                {
+                    // This is a closing deal for our EA
+                    double profit = HistoryDealGetDouble(deal_ticket, DEAL_PROFIT);
+                    double commission = HistoryDealGetDouble(deal_ticket, DEAL_COMMISSION);
+                    double swap = HistoryDealGetDouble(deal_ticket, DEAL_SWAP);
+                    double net_profit = profit + commission + swap;
+                    
+                    if (net_profit > 0)
+                    {
+                        g_winningTrades++;
+                        g_totalPipsGained += MathAbs(profit / (HistoryDealGetDouble(deal_ticket, DEAL_VOLUME) * 
+                            SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE)));
+                        Print("Trade closed: WIN +", DoubleToString(net_profit, 2));
+                    }
+                    else
+                    {
+                        g_losingTrades++;
+                        g_totalPipsLost += MathAbs(profit / (HistoryDealGetDouble(deal_ticket, DEAL_VOLUME) * 
+                            SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE)));
+                        Print("Trade closed: LOSS ", DoubleToString(net_profit, 2));
+                    }
+                    
+                    // Update campaign after close
+                    UpdateCampaignTracking();
+                }
+            }
         }
     }
 }
