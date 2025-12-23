@@ -5,10 +5,10 @@
 //+------------------------------------------------------------------+
 #property copyright "Box Strategy EA"
 #property link      "https://github.com/p99agent/box_strategy"
-#property version   "1.41"
-#property description "Box Strategy Scalping EA - Phase 2 MVP v1.4.1"
+#property version   "1.50"
+#property description "Box Strategy Scalping EA - Phase 2 MVP v1.5"
 #property description "EUR/USD | 10:00-12:00 ET | 9 pips box | 3 pips target"
-#property description "v1.4.1: Fix bias timing + Dynamic box stacking"
+#property description "v1.5: Session-end close to prevent overnight losses"
 
 //+------------------------------------------------------------------+
 //| Includes                                                          |
@@ -90,6 +90,9 @@ input double   InpADRThreshold = 0.80;    // ADR exhaustion threshold (80%)
 
 input group "=== Box Stacking (v1.4) ==="
 input bool     InpDynamicBoxes = true;    // Enable dynamic box stacking
+
+input group "=== Session Management (v1.5) ==="
+input bool     InpCloseOnSessionEnd = true;  // Close all trades at session end
 
 //+------------------------------------------------------------------+
 //| Global Variables                                                  |
@@ -205,6 +208,25 @@ bool IsNewSession()
         g_lastSessionDate = today;
         return true;
     }
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| v1.5: Detect session exit transition                              |
+//+------------------------------------------------------------------+
+bool JustExitedSession()
+{
+    static bool was_in_session = false;
+    bool is_in_session = IsInSession();
+    
+    // Detect transition from in-session to out-of-session
+    if (was_in_session && !is_in_session)
+    {
+        was_in_session = false;
+        return true;
+    }
+    
+    was_in_session = is_in_session;
     return false;
 }
 
@@ -985,7 +1007,7 @@ void UpdateInfoPanel()
     double current_pnl = AccountInfoDouble(ACCOUNT_EQUITY) - g_sessionStartEquity;
     
     string panel = "";
-    panel += "=== BOX STRATEGY EA v1.4.1 ===\n";
+    panel += "=== BOX STRATEGY EA v1.5 ===\n";
     panel += "Symbol: " + _Symbol + " | Mode: " + click_mode_str + "\n";
     panel += "----------------------------------------\n";
     
@@ -1043,7 +1065,8 @@ ENUM_ORDER_TYPE_FILLING GetFillingMode()
 int OnInit()
 {
     Print("==============================================");
-    Print("Box Strategy EA v1.4.1 - Phase 2 MVP");
+    Print("Box Strategy EA v1.5 - Phase 2 MVP");
+    Print("Session-end close: ", (InpCloseOnSessionEnd ? "ON" : "OFF"));
     Print("==============================================");
     
     if (_Symbol != MVP_SYMBOL)
@@ -1146,6 +1169,17 @@ void OnTick()
     if (IsNewSession())
     {
         ResetSessionCounters();
+    }
+    
+    // 1.5 v1.5: Close all trades at session end
+    if (InpCloseOnSessionEnd && JustExitedSession())
+    {
+        int positions_before = PositionsTotal();
+        if (positions_before > 0)
+        {
+            CloseAllPositions();
+            Print("=== SESSION END: Closed ", positions_before, " position(s) to prevent overnight hold ===");
+        }
     }
     
     // 2. v1.4: Update bias (once per D1 bar)
