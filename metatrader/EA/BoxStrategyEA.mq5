@@ -1003,21 +1003,6 @@ void TriggerEjection()
     CloseAllPositions();
 }
 
-void CloseAllPositions()
-{
-    for (int i = PositionsTotal() - 1; i >= 0; i--)
-    {
-        if (posInfo.SelectByIndex(i))
-        {
-            if (posInfo.Symbol() == _Symbol && posInfo.Magic() == InpMagicNumber)
-            {
-                trade.PositionClose(posInfo.Ticket());
-                Print("Closed position: ", posInfo.Ticket());
-            }
-        }
-    }
-}
-
 //+------------------------------------------------------------------+
 //| Visual Box Indicator                                              |
 //+------------------------------------------------------------------+
