@@ -5,10 +5,10 @@
 //+------------------------------------------------------------------+
 #property copyright "Box Strategy EA"
 #property link      "https://github.com/p99agent/box_strategy"
-#property version   "1.40"
-#property description "Box Strategy Scalping EA - Phase 2 MVP v1.4"
+#property version   "1.41"
+#property description "Box Strategy Scalping EA - Phase 2 MVP v1.4.1"
 #property description "EUR/USD | 10:00-12:00 ET | 9 pips box | 3 pips target"
-#property description "v1.4: Bias detection + Dynamic box stacking"
+#property description "v1.4.1: Fix bias timing + Dynamic box stacking"
 
 //+------------------------------------------------------------------+
 //| Includes                                                          |
@@ -354,10 +354,16 @@ void UpdateDailyBias()
 {
     if (!InpUseBias) return;
     
+    // v1.4.1 FIX: Guard against invalid ADR period (divide-by-zero)
+    if (InpADRPeriod < 1)
+    {
+        g_currentBias = BIAS_RANGING;
+        return;
+    }
+    
     // Only update once per D1 bar
     datetime current_d1 = iTime(_Symbol, PERIOD_D1, 0);
     if (current_d1 == g_lastBiasUpdate) return;
-    g_lastBiasUpdate = current_d1;
     
     // GUARD: Ensure sufficient history
     int bars = Bars(_Symbol, PERIOD_D1);
@@ -410,6 +416,10 @@ void UpdateDailyBias()
     
     // Final bias: structure unless exhausted
     g_currentBias = g_adrExhausted ? BIAS_RANGING : structure;
+    
+    // v1.4.1 FIX: Set timestamp AFTER successful calculation
+    // This ensures retry if early guards return
+    g_lastBiasUpdate = current_d1;
     
     Print("Daily Bias: ", EnumToString(g_currentBias), 
           " | ADR: ", DoubleToString(g_adrPips, 1), " pips",
@@ -496,8 +506,8 @@ void UpdateCampaignTracking()
 
 double GetCurrentDrawdownPips()
 {
-    UpdateCampaignTracking();
-    
+    // v1.4.1 FIX: Removed UpdateCampaignTracking() call to avoid side effects in getter
+    // Caller (OnTick) is responsible for calling UpdateCampaignTracking() first
     if (g_campaignDirection == 0 || g_campaignLots == 0)
         return 0;
     
@@ -632,8 +642,8 @@ void UpdateDynamicBoxStack()
     // Check for break above box top (with tolerance)
     if (current_price > break_up_level)
     {
-        // Reviewer feedback #5: Use break threshold in calculation
-        int boxes_to_add = (int)MathCeil((current_price - break_up_level) / box_height) + 1;
+        // v1.4.1 FIX: Use MathFloor+1 instead of MathCeil+1 to avoid skipping boxes
+        int boxes_to_add = (int)MathFloor((current_price - g_lastBoxTop) / box_height) + 1;
         boxes_to_add = MathMax(1, boxes_to_add);
         
         double old_top = g_lastBoxTop;
@@ -647,7 +657,8 @@ void UpdateDynamicBoxStack()
     // Check for break below box bottom (with tolerance)
     else if (current_price < break_down_level)
     {
-        int boxes_to_add = (int)MathCeil((break_down_level - current_price) / box_height) + 1;
+        // v1.4.1 FIX: Use MathFloor+1 instead of MathCeil+1 to avoid skipping boxes
+        int boxes_to_add = (int)MathFloor((g_lastBoxBottom - current_price) / box_height) + 1;
         boxes_to_add = MathMax(1, boxes_to_add);
         
         double old_bottom = g_lastBoxBottom;
@@ -1025,7 +1036,7 @@ ENUM_ORDER_TYPE_FILLING GetFillingMode()
 int OnInit()
 {
     Print("==============================================");
-    Print("Box Strategy EA v1.4 - Phase 2 MVP");
+    Print("Box Strategy EA v1.4.1 - Phase 2 MVP");
     Print("==============================================");
     
     if (_Symbol != MVP_SYMBOL)
@@ -1050,6 +1061,13 @@ int OnInit()
     trade.SetExpertMagicNumber(InpMagicNumber);
     trade.SetDeviationInPoints(10);
     trade.SetTypeFilling(GetFillingMode());
+    
+    // v1.4.1 FIX: Validate InpADRPeriod to prevent divide-by-zero
+    if (InpUseBias && InpADRPeriod < 1)
+    {
+        Print("WARNING: InpADRPeriod must be >= 1, bias detection disabled");
+        // Can't modify input, so we'll handle in UpdateDailyBias
+    }
     
     LoadStateFromGlobalVariables();
     
