@@ -647,10 +647,62 @@ void UseClick()
 //+------------------------------------------------------------------+
 //| v1.5.1: Session-End Position Management                           |
 //+------------------------------------------------------------------+
+bool ClosePositionWithComment(ulong ticket, ENUM_POSITION_TYPE pos_type, double volume, string comment)
+{
+    // Note: CTrade::PositionClose does not support custom comments in many builds.
+    // We close via OrderSend(TRADE_ACTION_DEAL) so the deal comment is populated.
+
+    ENUM_ORDER_TYPE order_type = (pos_type == POSITION_TYPE_BUY)
+        ? ORDER_TYPE_SELL
+        : ORDER_TYPE_BUY;
+
+    double price = (order_type == ORDER_TYPE_SELL)
+        ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+        : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+    MqlTradeRequest req;
+    MqlTradeResult  res;
+    ZeroMemory(req);
+    ZeroMemory(res);
+
+    req.action       = TRADE_ACTION_DEAL;
+    req.symbol       = _Symbol;
+    req.position     = ticket;
+    req.magic        = InpMagicNumber;
+    req.volume       = volume;
+    req.type         = order_type;
+    req.price        = price;
+    req.deviation    = 10;
+    req.type_filling = GetFillingMode();
+    req.comment      = comment;
+
+    if (!OrderSend(req, res))
+    {
+        Print("Close failed for #", ticket, " err=", GetLastError());
+        return false;
+    }
+
+    if (res.retcode != TRADE_RETCODE_DONE)
+    {
+        Print("Close rejected for #", ticket, " ret=", res.retcode, " ", res.comment);
+        return false;
+    }
+
+    return true;
+}
+
+bool CloseSelectedPositionWithComment(string comment)
+{
+    if (posInfo.Symbol() != _Symbol || posInfo.Magic() != InpMagicNumber)
+        return false;
+
+    return ClosePositionWithComment(posInfo.Ticket(), (ENUM_POSITION_TYPE)posInfo.PositionType(), posInfo.Volume(), comment);
+}
+
 void CloseAllPositions(string comment = "")
 {
-    if (comment != "")
-        trade.SetComment(comment);
+    int closed = 0;
+    int failed = 0;
 
     for (int i = PositionsTotal() - 1; i >= 0; i--)
     {
@@ -658,19 +710,28 @@ void CloseAllPositions(string comment = "")
         {
             if (posInfo.Symbol() == _Symbol && posInfo.Magic() == InpMagicNumber)
             {
-                trade.PositionClose(posInfo.Ticket());
+                ulong ticket = posInfo.Ticket();
+                double volume = posInfo.Volume();
+                ENUM_POSITION_TYPE ptype = (ENUM_POSITION_TYPE)posInfo.PositionType();
+
+                if (ClosePositionWithComment(ticket, ptype, volume, comment))
+                    closed++;
+                else
+                    failed++;
             }
         }
     }
 
-    if (comment != "")
-        trade.SetComment("");
+    if (comment != "" && (closed > 0 || failed > 0))
+        Print("CloseAllPositions [", comment, "] closed=", closed, " failed=", failed);
 }
 
 void CloseWorstTrade(string comment = "")
 {
     double worst_pnl = 0;
     ulong worst_ticket = 0;
+    double worst_volume = 0;
+    ENUM_POSITION_TYPE worst_type = POSITION_TYPE_BUY;
     
     for (int i = 0; i < PositionsTotal(); i++)
     {
@@ -683,6 +744,8 @@ void CloseWorstTrade(string comment = "")
                 {
                     worst_pnl = pnl;
                     worst_ticket = posInfo.Ticket();
+                    worst_volume = posInfo.Volume();
+                    worst_type = (ENUM_POSITION_TYPE)posInfo.PositionType();
                 }
             }
         }
@@ -690,14 +753,7 @@ void CloseWorstTrade(string comment = "")
     
     if (worst_ticket > 0)
     {
-        if (comment != "")
-            trade.SetComment(comment);
-
-        trade.PositionClose(worst_ticket);
-
-        if (comment != "")
-            trade.SetComment("");
-
+        ClosePositionWithComment(worst_ticket, worst_type, worst_volume, comment);
         Print("=== SESSION END: Closed worst position #", worst_ticket, " P/L: $", DoubleToString(worst_pnl, 2), " ===");
     }
 }
