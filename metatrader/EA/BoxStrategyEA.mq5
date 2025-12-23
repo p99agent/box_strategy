@@ -816,7 +816,8 @@ void UpdateInfoPanel()
     panel += "Drawdown: " + DoubleToString(GetCurrentDrawdownPips(), 1) + " pips\n";
     panel += "----------------------------------------\n";
     panel += "Session P/L: " + (current_pnl >= 0 ? "+" : "") + DoubleToString(current_pnl, 2) + "\n";
-    panel += "Wins: " + IntegerToString(g_winningTrades) + " | Losses: " + IntegerToString(g_losingTrades) + "\n";
+    panel += "Trades: " + IntegerToString(g_totalTrades) + " | Wins: " + IntegerToString(g_winningTrades) + " | Losses: " + IntegerToString(g_losingTrades) + "\n";
+    panel += "Lot Size: " + DoubleToString(CalculateLotSize(), 2) + "\n";
     panel += "----------------------------------------\n";
     panel += "Box Top: " + DoubleToString(g_lastBoxTop, 5) + " (SELL)\n";
     panel += "Box Bottom: " + DoubleToString(g_lastBoxBottom, 5) + " (BUY)\n";
@@ -846,7 +847,7 @@ ENUM_ORDER_TYPE_FILLING GetFillingMode()
 int OnInit()
 {
     Print("==============================================");
-    Print("Box Strategy EA v1.2 - Phase 1 MVP");
+    Print("Box Strategy EA v1.3 - Phase 1 MVP");
     Print("==============================================");
     
     // Validate symbol
@@ -889,6 +890,24 @@ int OnInit()
     else
     {
         Print("Resuming session. Clicks used: ", g_sessionClicksUsed);
+        
+        // v1.3 FIX: Startup recycle check when already flat + profitable
+        if (InpClickMode == CLICK_MODE_RECYCLE && g_sessionClicksUsed > 0)
+        {
+            UpdateCampaignTracking();
+            if (g_openPositionsCount == 0 && g_sessionClicksUsed > 0)
+            {
+                // We're flat but have used clicks - check for recycle
+                double current_pnl = AccountInfoDouble(ACCOUNT_EQUITY) - g_sessionStartEquity;
+                if (current_pnl >= 0)
+                {
+                    Print("Startup recycle: Flat + profitable, resetting clicks");
+                    g_sessionClicksUsed = 0;
+                    g_currentBox = 1;
+                    SaveStateToGlobalVariables();
+                }
+            }
+        }
     }
     
     // Initialize box edges
@@ -901,7 +920,8 @@ int OnInit()
     Print("Filling Mode: ", EnumToString(GetFillingMode()));
     Print("Max Stop: ", MAX_STOP_PIPS, " pips");
     Print("Take Profit: ", TAKE_PROFIT_PIPS, " pips");
-    Print("Entry Throttle: 1 trade per M1 bar (v1.2)");
+    Print("Entry Throttle: 1 trade per M1 bar");
+    Print("Click Mode: ", (InpClickMode == CLICK_MODE_RECYCLE ? "RECYCLE" : "SESSION"));
     Print("Box Visualization: ", (InpShowBoxes ? "ON" : "OFF"));
     Print("==============================================");
     
