@@ -8,7 +8,7 @@
 #property version   "1.51"
 #property description "Box Strategy Scalping EA - Phase 2 MVP v1.5.1"
 #property description "EUR/USD | 10:00-12:00 ET | 9 pips box | 3 pips target"
-#property description "v1.5.1: Smart session-end close (drawdown-based)"
+#property description "v1.6: SPEC-010 shared TP layering + session-end close trace"
 
 //+------------------------------------------------------------------+
 //| Includes                                                          |
@@ -102,6 +102,10 @@ input ENUM_SESSION_CLOSE InpSessionCloseMode = CLOSE_SMART;  // Session end mode
 input double   InpMaxHoldDrawdown = 18.0;   // Max pips to hold overnight (2 boxes)
 input double   InpReduceDrawdown = 27.0;    // Pips threshold to reduce position (3 boxes)
 
+input group "=== Layering / Break-even (SPEC-010) ==="
+input bool     InpUseSharedTP = true;          // Shared TP based on basket average entry
+input int      InpSharedTPMinPositions = 2;    // Apply when >= this many positions
+
 //+------------------------------------------------------------------+
 //| Global Variables                                                  |
 //+------------------------------------------------------------------+
@@ -120,6 +124,11 @@ bool           g_ejectionTriggered = false;
 int            g_campaignDirection = 0;  // 1 = long, -1 = short, 0 = none
 double         g_campaignEntryPrice = 0; // Weighted average entry
 double         g_campaignLots = 0;       // Total lots in campaign
+
+// v1.6: SPEC-010 shared TP (basket break-even) state
+int            g_sharedTPPositions = 0;
+int            g_sharedTPDirection = 0;
+double         g_sharedTPPrice = 0;
 
 // Box edge tracking
 double         g_lastBoxTop = 0;
@@ -167,6 +176,12 @@ double GetPipSize()
         return point * 10;
     else
         return point;
+}
+
+double NormalizePrice(double price)
+{
+    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+    return NormalizeDouble(price, digits);
 }
 
 //+------------------------------------------------------------------+
@@ -284,6 +299,12 @@ void ResetSessionCounters()
     g_campaignDirection = 0;
     g_campaignEntryPrice = 0;
     g_campaignLots = 0;
+
+    // v1.6: Reset shared TP state
+    g_sharedTPPositions = 0;
+    g_sharedTPDirection = 0;
+    g_sharedTPPrice = 0;
+
     g_lastTradeBar = 0;
     g_sessionPnL = 0;
     g_openPositionsCount = 0;
@@ -626,8 +647,11 @@ void UseClick()
 //+------------------------------------------------------------------+
 //| v1.5.1: Session-End Position Management                           |
 //+------------------------------------------------------------------+
-void CloseAllPositions()
+void CloseAllPositions(string comment = "")
 {
+    if (comment != "")
+        trade.SetComment(comment);
+
     for (int i = PositionsTotal() - 1; i >= 0; i--)
     {
         if (posInfo.SelectByIndex(i))
@@ -638,9 +662,12 @@ void CloseAllPositions()
             }
         }
     }
+
+    if (comment != "")
+        trade.SetComment("");
 }
 
-void CloseWorstTrade()
+void CloseWorstTrade(string comment = "")
 {
     double worst_pnl = 0;
     ulong worst_ticket = 0;
@@ -663,7 +690,14 @@ void CloseWorstTrade()
     
     if (worst_ticket > 0)
     {
+        if (comment != "")
+            trade.SetComment(comment);
+
         trade.PositionClose(worst_ticket);
+
+        if (comment != "")
+            trade.SetComment("");
+
         Print("=== SESSION END: Closed worst position #", worst_ticket, " P/L: $", DoubleToString(worst_pnl, 2), " ===");
     }
 }
@@ -684,11 +718,14 @@ void HandleSessionEnd()
         Print("Session end: No open positions");
         return;
     }
-    
+
+    string close_comment = StringFormat("SE:%s dd=%.1f", 
+        (InpSessionCloseMode == CLOSE_ALL ? "ALL" : "SMART"), drawdown);
+
     if (InpSessionCloseMode == CLOSE_ALL)
     {
-        CloseAllPositions();
-        Print("=== SESSION END: Mode=CLOSE_ALL, closed ", positions, " position(s) ===");
+        CloseAllPositions(close_comment);
+        Print("=== SESSION END: Mode=CLOSE_ALL, closed ", positions, " position(s) | DD=", DoubleToString(drawdown, 1), " pips ===");
         return;
     }
     
@@ -707,13 +744,213 @@ void HandleSessionEnd()
     
     if (drawdown <= InpReduceDrawdown)
     {
+        string reduce_comment = StringFormat("SE:WORST dd=%.1f", drawdown);
         Print("Session end: DD=", DoubleToString(drawdown, 1), " pips, reducing position");
-        CloseWorstTrade();
+        CloseWorstTrade(reduce_comment);
         return;
     }
     
     Print("Session end: DD=", DoubleToString(drawdown, 1), " > ", InpReduceDrawdown, " pips, closing all");
-    CloseAllPositions();
+    CloseAllPositions(StringFormat("SE:ALL dd=%.1f", drawdown));
+}
+
+//+------------------------------------------------------------------+
+//| v1.6: SPEC-010 Shared TP Layering (Basket Break-even)             |
+//+------------------------------------------------------------------+
+bool GetBasketState(int &direction, double &avg_entry, double &total_lots, int &positions_count)
+{
+    direction = 0;
+    total_lots = 0;
+    avg_entry = 0;
+    positions_count = 0;
+
+    double weighted_sum = 0;
+
+    for (int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        if (posInfo.SelectByIndex(i))
+        {
+            if (posInfo.Symbol() == _Symbol && posInfo.Magic() == InpMagicNumber)
+            {
+                positions_count++;
+
+                int dir = (posInfo.PositionType() == POSITION_TYPE_BUY) ? 1 : -1;
+                if (direction == 0)
+                    direction = dir;
+                else if (direction != dir)
+                    return false; // mixed directions, don't apply basket TP
+
+                double lots = posInfo.Volume();
+                double entry = posInfo.PriceOpen();
+
+                total_lots += lots;
+                weighted_sum += entry * lots;
+            }
+        }
+    }
+
+    if (positions_count <= 0 || total_lots <= 0)
+        return false;
+
+    if (direction == 0)
+        return false;
+
+    avg_entry = weighted_sum / total_lots;
+    return true;
+}
+
+double GetSharedTPPrice(int direction, double avg_entry)
+{
+    double pip_size = GetPipSize();
+    double target = (direction == 1)
+        ? (avg_entry + (TAKE_PROFIT_PIPS * pip_size))
+        : (avg_entry - (TAKE_PROFIT_PIPS * pip_size));
+
+    return NormalizePrice(target);
+}
+
+bool ModifyPositionSLTP(ulong ticket, double sl, double tp, string comment)
+{
+    MqlTradeRequest req;
+    MqlTradeResult  res;
+    ZeroMemory(req);
+    ZeroMemory(res);
+
+    req.action   = TRADE_ACTION_SLTP;
+    req.symbol   = _Symbol;
+    req.position = ticket;
+    req.magic    = InpMagicNumber;
+    req.sl       = sl;
+    req.tp       = tp;
+    req.comment  = comment;
+
+    if (!OrderSend(req, res))
+    {
+        Print("SPEC-010: OrderSend SLTP failed for #", ticket, " err=", GetLastError());
+        return false;
+    }
+
+    if (res.retcode != TRADE_RETCODE_DONE)
+    {
+        Print("SPEC-010: SLTP modify rejected for #", ticket, " ret=", res.retcode, " ", res.comment);
+        return false;
+    }
+
+    return true;
+}
+
+void RestoreSinglePositionTP()
+{
+    double pip_size = GetPipSize();
+
+    for (int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        if (posInfo.SelectByIndex(i))
+        {
+            if (posInfo.Symbol() == _Symbol && posInfo.Magic() == InpMagicNumber)
+            {
+                int direction = (posInfo.PositionType() == POSITION_TYPE_BUY) ? 1 : -1;
+                double entry = posInfo.PriceOpen();
+                double sl = posInfo.StopLoss();
+
+                double tp = (direction == 1)
+                    ? (entry + (TAKE_PROFIT_PIPS * pip_size))
+                    : (entry - (TAKE_PROFIT_PIPS * pip_size));
+
+                tp = NormalizePrice(tp);
+
+                // Set back to per-position TP
+                ModifyPositionSLTP(posInfo.Ticket(), sl, tp, "SPEC010:RESTORE");
+            }
+        }
+    }
+}
+
+void HandleSharedTP_Layering()
+{
+    if (!InpUseSharedTP)
+        return;
+
+    int direction;
+    double avg_entry;
+    double total_lots;
+    int positions_count;
+
+    if (!GetBasketState(direction, avg_entry, total_lots, positions_count))
+    {
+        g_sharedTPPositions = 0;
+        g_sharedTPDirection = 0;
+        g_sharedTPPrice = 0;
+        return;
+    }
+
+    // If we were layered and now only 1 position remains, restore its TP
+    if (positions_count < InpSharedTPMinPositions)
+    {
+        if (positions_count == 1 && g_sharedTPPositions >= InpSharedTPMinPositions)
+        {
+            RestoreSinglePositionTP();
+        }
+
+        g_sharedTPPositions = positions_count;
+        g_sharedTPDirection = direction;
+        g_sharedTPPrice = 0;
+        return;
+    }
+
+    double pip_size = GetPipSize();
+    double tolerance = pip_size / 4.0;
+
+    double shared_tp = GetSharedTPPrice(direction, avg_entry);
+
+    // If target is already hit, close basket immediately
+    double price = (direction == 1)
+        ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+        : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+    bool hit = (direction == 1) ? (price >= shared_tp) : (price <= shared_tp);
+    if (hit)
+    {
+        Print("=== SPEC-010: Basket TP HIT | TP=", DoubleToString(shared_tp, 5), " | Positions=", positions_count, " ===");
+        CloseAllPositions("SPEC010:TP");
+        return;
+    }
+
+    // Only re-apply when basket TP changes materially or positions/direction changes
+    bool changed = (positions_count != g_sharedTPPositions) || (direction != g_sharedTPDirection) || (MathAbs(shared_tp - g_sharedTPPrice) > tolerance);
+    if (!changed)
+        return;
+
+    int modified = 0;
+    int failed = 0;
+
+    for (int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        if (posInfo.SelectByIndex(i))
+        {
+            if (posInfo.Symbol() == _Symbol && posInfo.Magic() == InpMagicNumber)
+            {
+                double cur_tp = posInfo.TakeProfit();
+                if (MathAbs(cur_tp - shared_tp) <= tolerance)
+                    continue;
+
+                double sl = posInfo.StopLoss();
+                ulong ticket = posInfo.Ticket();
+
+                if (ModifyPositionSLTP(ticket, sl, shared_tp, "SPEC010:SETTP"))
+                    modified++;
+                else
+                    failed++;
+            }
+        }
+    }
+
+    g_sharedTPPositions = positions_count;
+    g_sharedTPDirection = direction;
+    g_sharedTPPrice = shared_tp;
+
+    Print("=== SPEC-010: Shared TP applied | TP=", DoubleToString(shared_tp, 5), " | Positions=", positions_count,
+          " | Modified=", modified, " | Failed=", failed, " ===");
 }
 
 //+------------------------------------------------------------------+
@@ -946,6 +1183,7 @@ bool OpenBuyTrade()
         g_totalTrades++;
         Print("BUY opened: ", lot_size, " lots @ ", ask, " SL: ", sl, " TP: ", tp);
         UpdateCampaignTracking();
+        HandleSharedTP_Layering();
         DrawEntryLine(ask, true);
         return true;
     }
@@ -976,6 +1214,7 @@ bool OpenSellTrade()
         g_totalTrades++;
         Print("SELL opened: ", lot_size, " lots @ ", bid, " SL: ", sl, " TP: ", tp);
         UpdateCampaignTracking();
+        HandleSharedTP_Layering();
         DrawEntryLine(bid, false);
         return true;
     }
@@ -1000,7 +1239,7 @@ void TriggerEjection()
     Alert("!!! EJECTION TRIGGERED - Closing all positions !!!");
     Print("Ejection at Box ", g_currentBox, " - Drawdown exceeded ", MAX_STOP_PIPS, " pips");
     
-    CloseAllPositions();
+    CloseAllPositions("EJECTION");
 }
 
 //+------------------------------------------------------------------+
@@ -1094,7 +1333,7 @@ void UpdateInfoPanel()
     double current_pnl = AccountInfoDouble(ACCOUNT_EQUITY) - g_sessionStartEquity;
     
     string panel = "";
-    panel += "=== BOX STRATEGY EA v1.5.1 ===\n";
+    panel += "=== BOX STRATEGY EA v1.6 ===\n";
     panel += "Symbol: " + _Symbol + " | Mode: " + click_mode_str + "\n";
     panel += "----------------------------------------\n";
     
@@ -1152,8 +1391,9 @@ ENUM_ORDER_TYPE_FILLING GetFillingMode()
 int OnInit()
 {
     Print("==============================================");
-    Print("Box Strategy EA v1.5.1 - Phase 2 MVP");
+    Print("Box Strategy EA v1.6 - Phase 2 MVP");
     Print("Session end mode: ", EnumToString(InpSessionCloseMode));
+    Print("SPEC-010 shared TP: ", (InpUseSharedTP ? "ON" : "OFF"));
     Print("==============================================");
     
     if (_Symbol != MVP_SYMBOL)
@@ -1257,24 +1497,29 @@ void OnTick()
     {
         ResetSessionCounters();
     }
-    
-    // 1.5 v1.5.1: Smart session-end management
+
+    // 2. Update campaign tracking early (session-end + layering logic depends on this)
+    UpdateCampaignTracking();
+
+    // 3. v1.5.1: Smart session-end management
     if (JustExitedSession())
     {
         HandleSessionEnd();
+        // Refresh state after any forced closes
+        UpdateCampaignTracking();
     }
+
+    // 3.5 v1.6: SPEC-010 shared TP layering (basket break-even)
+    HandleSharedTP_Layering();
     
-    // 2. v1.4: Update bias (once per D1 bar)
+    // 4. v1.4: Update bias (once per D1 bar)
     if (InpUseBias)
     {
         UpdateDailyBias();
     }
     
-    // 3. v1.4: Update hourly range (once per H1 bar)
+    // 5. v1.4: Update hourly range (once per H1 bar)
     UpdateHourlyRange();
-    
-    // 4. Update campaign tracking
-    UpdateCampaignTracking();
     
     // 5. v1.4: Initialize box if needed (Reviewer feedback #3)
     if (!g_boxInitialized)
@@ -1360,6 +1605,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
                     }
                     
                     UpdateCampaignTracking();
+                    HandleSharedTP_Layering();
                 }
             }
         }
