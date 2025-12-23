@@ -357,6 +357,7 @@ void UpdateDailyBias()
     // v1.4.1 FIX: Guard against invalid ADR period (divide-by-zero)
     if (InpADRPeriod < 1)
     {
+        ClearBiasState();  // v1.4.1 polish: clear stale ADR values
         g_currentBias = BIAS_RANGING;
         return;
     }
@@ -369,7 +370,13 @@ void UpdateDailyBias()
     int bars = Bars(_Symbol, PERIOD_D1);
     if (bars < InpADRPeriod + 2)
     {
-        Print("WARNING: Insufficient D1 bars (", bars, ") for bias detection");
+        // v1.4.1 polish: Rate-limit this warning to avoid log spam
+        static datetime last_history_warning = 0;
+        if (TimeCurrent() - last_history_warning > 30)
+        {
+            Print("WARNING: Insufficient D1 bars (", bars, ") for bias detection");
+            last_history_warning = TimeCurrent();
+        }
         ClearBiasState();
         g_currentBias = BIAS_RANGING;
         return;
@@ -978,7 +985,7 @@ void UpdateInfoPanel()
     double current_pnl = AccountInfoDouble(ACCOUNT_EQUITY) - g_sessionStartEquity;
     
     string panel = "";
-    panel += "=== BOX STRATEGY EA v1.4 ===\n";
+    panel += "=== BOX STRATEGY EA v1.4.1 ===\n";
     panel += "Symbol: " + _Symbol + " | Mode: " + click_mode_str + "\n";
     panel += "----------------------------------------\n";
     
