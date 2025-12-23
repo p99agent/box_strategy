@@ -5,10 +5,10 @@
 //+------------------------------------------------------------------+
 #property copyright "Box Strategy EA"
 #property link      "https://github.com/p99agent/box_strategy"
-#property version   "1.50"
-#property description "Box Strategy Scalping EA - Phase 2 MVP v1.5"
+#property version   "1.51"
+#property description "Box Strategy Scalping EA - Phase 2 MVP v1.5.1"
 #property description "EUR/USD | 10:00-12:00 ET | 9 pips box | 3 pips target"
-#property description "v1.5: Session-end close to prevent overnight losses"
+#property description "v1.5.1: Smart session-end close (drawdown-based)"
 
 //+------------------------------------------------------------------+
 //| Includes                                                          |
@@ -59,6 +59,12 @@ enum ENUM_BIAS {
     BIAS_RANGING          // Ranging: Mixed or ADR exhausted
 };
 
+enum ENUM_SESSION_CLOSE {
+    CLOSE_NONE,           // HOLD: Keep all trades overnight
+    CLOSE_ALL,            // CLOSE ALL: Close everything at session end
+    CLOSE_SMART           // SMART: Based on drawdown level (recommended)
+};
+
 //+------------------------------------------------------------------+
 //| Input Parameters                                                  |
 //+------------------------------------------------------------------+
@@ -91,8 +97,10 @@ input double   InpADRThreshold = 0.80;    // ADR exhaustion threshold (80%)
 input group "=== Box Stacking (v1.4) ==="
 input bool     InpDynamicBoxes = true;    // Enable dynamic box stacking
 
-input group "=== Session Management (v1.5) ==="
-input bool     InpCloseOnSessionEnd = true;  // Close all trades at session end
+input group "=== Session Management (v1.5.1) ==="
+input ENUM_SESSION_CLOSE InpSessionCloseMode = CLOSE_SMART;  // Session end mode
+input double   InpMaxHoldDrawdown = 18.0;   // Max pips to hold overnight (2 boxes)
+input double   InpReduceDrawdown = 27.0;    // Pips threshold to reduce position (3 boxes)
 
 //+------------------------------------------------------------------+
 //| Global Variables                                                  |
@@ -614,6 +622,100 @@ void UseClick()
           " | Box ", g_currentBox, ": ", GetClicksUsedInCurrentBox(), "/", CLICKS_PER_BOX);
 }
 
+
+//+------------------------------------------------------------------+
+//| v1.5.1: Session-End Position Management                           |
+//+------------------------------------------------------------------+
+void CloseAllPositions()
+{
+    for (int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        if (posInfo.SelectByIndex(i))
+        {
+            if (posInfo.Symbol() == _Symbol && posInfo.Magic() == InpMagicNumber)
+            {
+                trade.PositionClose(posInfo.Ticket());
+            }
+        }
+    }
+}
+
+void CloseWorstTrade()
+{
+    double worst_pnl = 0;
+    ulong worst_ticket = 0;
+    
+    for (int i = 0; i < PositionsTotal(); i++)
+    {
+        if (posInfo.SelectByIndex(i))
+        {
+            if (posInfo.Symbol() == _Symbol && posInfo.Magic() == InpMagicNumber)
+            {
+                double pnl = posInfo.Profit();
+                if (pnl < worst_pnl)
+                {
+                    worst_pnl = pnl;
+                    worst_ticket = posInfo.Ticket();
+                }
+            }
+        }
+    }
+    
+    if (worst_ticket > 0)
+    {
+        trade.PositionClose(worst_ticket);
+        Print("=== SESSION END: Closed worst position #", worst_ticket, " P/L: $", DoubleToString(worst_pnl, 2), " ===");
+    }
+}
+
+void HandleSessionEnd()
+{
+    if (InpSessionCloseMode == CLOSE_NONE)
+    {
+        Print("Session end: Mode=HOLD, keeping all trades");
+        return;
+    }
+    
+    double drawdown = GetCurrentDrawdownPips();
+    int positions = g_openPositionsCount;
+    
+    if (positions == 0)
+    {
+        Print("Session end: No open positions");
+        return;
+    }
+    
+    if (InpSessionCloseMode == CLOSE_ALL)
+    {
+        CloseAllPositions();
+        Print("=== SESSION END: Mode=CLOSE_ALL, closed ", positions, " position(s) ===");
+        return;
+    }
+    
+    // CLOSE_SMART mode
+    if (drawdown <= 0)
+    {
+        Print("Session end: In profit/flat, holding ", positions, " position(s)");
+        return;
+    }
+    
+    if (drawdown <= InpMaxHoldDrawdown)
+    {
+        Print("Session end: DD=", DoubleToString(drawdown, 1), " <= ", InpMaxHoldDrawdown, " pips, holding");
+        return;
+    }
+    
+    if (drawdown <= InpReduceDrawdown)
+    {
+        Print("Session end: DD=", DoubleToString(drawdown, 1), " pips, reducing position");
+        CloseWorstTrade();
+        return;
+    }
+    
+    Print("Session end: DD=", DoubleToString(drawdown, 1), " > ", InpReduceDrawdown, " pips, closing all");
+    CloseAllPositions();
+}
+
 //+------------------------------------------------------------------+
 //| v1.4: Dynamic Box Stacking (SPEC-006 Enhanced)                    |
 //+------------------------------------------------------------------+
@@ -1007,7 +1109,7 @@ void UpdateInfoPanel()
     double current_pnl = AccountInfoDouble(ACCOUNT_EQUITY) - g_sessionStartEquity;
     
     string panel = "";
-    panel += "=== BOX STRATEGY EA v1.5 ===\n";
+    panel += "=== BOX STRATEGY EA v1.5.1 ===\n";
     panel += "Symbol: " + _Symbol + " | Mode: " + click_mode_str + "\n";
     panel += "----------------------------------------\n";
     
@@ -1065,8 +1167,8 @@ ENUM_ORDER_TYPE_FILLING GetFillingMode()
 int OnInit()
 {
     Print("==============================================");
-    Print("Box Strategy EA v1.5 - Phase 2 MVP");
-    Print("Session-end close: ", (InpCloseOnSessionEnd ? "ON" : "OFF"));
+    Print("Box Strategy EA v1.5.1 - Phase 2 MVP");
+    Print("Session end mode: ", EnumToString(InpSessionCloseMode));
     Print("==============================================");
     
     if (_Symbol != MVP_SYMBOL)
@@ -1171,15 +1273,10 @@ void OnTick()
         ResetSessionCounters();
     }
     
-    // 1.5 v1.5: Close all trades at session end
-    if (InpCloseOnSessionEnd && JustExitedSession())
+    // 1.5 v1.5.1: Smart session-end management
+    if (JustExitedSession())
     {
-        int positions_before = PositionsTotal();
-        if (positions_before > 0)
-        {
-            CloseAllPositions();
-            Print("=== SESSION END: Closed ", positions_before, " position(s) to prevent overnight hold ===");
-        }
+        HandleSessionEnd();
     }
     
     // 2. v1.4: Update bias (once per D1 bar)
