@@ -884,9 +884,26 @@ void HandleSharedTP_Layering()
         return;
     }
 
-    // If we were layered and now only 1 position remains, restore its TP
+    // If we were layered and now dropped below the threshold, we might have partially TP'd.
+    // In that case, close any remaining legs at the last known basket TP.
     if (positions_count < InpSharedTPMinPositions)
     {
+        if (g_sharedTPPositions >= InpSharedTPMinPositions && g_sharedTPPrice > 0 && g_sharedTPDirection != 0)
+        {
+            double price = (g_sharedTPDirection == 1)
+                ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+            bool hit = (g_sharedTPDirection == 1) ? (price >= g_sharedTPPrice) : (price <= g_sharedTPPrice);
+            if (hit)
+            {
+                Print("=== SPEC-010: Basket TP HIT (leftover close) | TP=", DoubleToString(g_sharedTPPrice, 5), " | Remaining=", positions_count, " ===");
+                CloseAllPositions("SPEC010:TP");
+                return;
+            }
+        }
+
+        // If we were layered and now only 1 position remains (but TP not hit), restore its per-position TP
         if (positions_count == 1 && g_sharedTPPositions >= InpSharedTPMinPositions)
         {
             RestoreSinglePositionTP();
